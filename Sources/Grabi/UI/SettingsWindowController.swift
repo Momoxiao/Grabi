@@ -30,6 +30,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var switcher: NSSegmentedControl!
     private var paneScroll: NSScrollView!
     private var contentHost: NSView!
+    /// 上一次真正挂上的面板。用来决定换页动画的方向（向右切还是向左切）。
+    private var currentPaneIndex = 0
 
     private var pathLabel: NSTextField!
     private var namePatternField: NSTextField!
@@ -87,9 +89,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         // 不是刚发生了。`refresh()` 会清语言那行，这一行也得在开场时归零。
         hotKeyStatusLabel?.stringValue = ""
         refresh()
+        let wasVisible = window?.isVisible == true
+        // 先落到 0 再上屏，避免窗口在屏幕上闪一帧满透明度再开始淡入。
+        if !wasVisible, let window { window.alphaValue = 0 }
         showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+        // 只在窗口真正新出现时淡入；已经开着、只是被再次唤醒时不再闪一下。
+        if !wasVisible, let window {
+            Motion.run(duration: Design.Timing.fade, curve: Motion.Curve.enter) {
+                window.animator().alphaValue = 1
+            }
+        }
     }
 
     func refresh() {
@@ -334,7 +345,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         guard panes.indices.contains(index), let window else { return }
 
         let content = attachPane(index)
-        content.alphaValue = 0
+        let direction: CGFloat = index >= currentPaneIndex ? 1 : -1
+        currentPaneIndex = index
 
         // 高度不写死：先把这棵树真的排一遍，读它排出来的高，再让窗口长成这个高。
         // 之前是四个手调常量（250/330/360/430），改一次排版就得回来对表；
@@ -355,16 +367,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         lastPaneOverflow = plan.overflow
 
         if animate {
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = Motion.duration(0.18)
-                content.animator().alphaValue = 1
+            // 新面板从切换方向的一侧轻轻滑进来，同时窗口高度在同一口气里长 / 缩。
+            // 距离只有 6pt：够说明"换了一页"，又不会让表单像轮播图一样飞。
+            Motion.reveal(content, offset: CGSize(width: 6 * direction, height: 0),
+                          duration: 0.20)
+            Motion.run(duration: Design.Timing.settle, curve: Motion.Curve.move) {
+                window.animator().setFrame(Self.frame(forContentHeight: plan.height,
+                                                      of: window), display: true)
             }
         } else {
             content.alphaValue = 1
+            window.setFrame(Self.frame(forContentHeight: plan.height, of: window),
+                            display: true, animate: false)
         }
-
-        window.setFrame(Self.frame(forContentHeight: plan.height, of: window),
-                        display: true, animate: animate && !Motion.isReduced)
         // 换面板回到顶部：从最长的「快捷键」切回短的「保存」时，若停在原来的滚动位置，
         // 窗口会开在一片空白上。
         //
@@ -1698,11 +1713,22 @@ final class SettingsWindow: NSWindow {
 final class SettingsCardView: NSView {
     override var isFlipped: Bool { true }
 
+    /// 分组卡片是"抬起的一张纸"，不是"挖下去的一块灰"。
+    ///
+    /// 之前用 `quaternaryLabelColor`：浅色下它把卡片压得比窗口底还暗（实测
+    /// #ECECEC → #D5D5D5），整页看起来像一排禁用控件。现在浅色用接近纯白的
+    /// 纸面，深色用比窗口高一档的炭灰；两边都只靠 1pt 分隔线定边界，不做重阴影。
+    private static let fill = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(white: 0.23, alpha: 1)
+            : NSColor(white: 0.985, alpha: 1)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         // 内缩 0.5：描边压在像素格子上而不是跨两格，1× 屏上才不会糊成一条灰边
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-                                xRadius: 8, yRadius: 8)
-        NSColor.quaternaryLabelColor.setFill()
+                                xRadius: Design.Radius.card, yRadius: Design.Radius.card)
+        Self.fill.setFill()
         path.fill()
         NSColor.separatorColor.setStroke()
         path.lineWidth = 1

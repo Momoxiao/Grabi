@@ -117,6 +117,9 @@ final class ShotOverlayController {
             view.candidates = candidates
 
             window.contentView = view
+            // 覆盖层从透明里落下来：快捷键按下去时屏幕不是"啪"地换了一张脸，
+            // 而是先出现一层浅压暗，再让候选框接管视觉。只进行一次，鼠标移动不会重跑。
+            window.alphaValue = 0
             window.orderFrontRegardless()
             window.makeKey()
             windows.append(window)
@@ -130,6 +133,10 @@ final class ShotOverlayController {
         if let target = windows.first(where: { $0.frame.contains(mouse) }) {
             target.makeKey()
             (target.contentView as? OverlayView)?.refreshHover(atScreenPoint: mouse)
+        }
+
+        Motion.run(duration: Design.Timing.fade, curve: Motion.Curve.enter) {
+            for window in windows { window.animator().alphaValue = 1 }
         }
 
         hintScreen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
@@ -157,7 +164,7 @@ final class ShotOverlayController {
         hintHideWorkItem = nil
         isHintVisible = false
         for window in windows {
-            (window.contentView as? OverlayView)?.needsDisplay = true
+            (window.contentView as? OverlayView)?.fadeHintOut()
         }
     }
 
@@ -225,6 +232,16 @@ final class OverlayView: NSView {
     private var hoverWindow: SCWindow?
     private var hoverIsDisplay = false
 
+    /// 候选框的**屏幕呈现位置**。鼠标从一个窗口移到另一个窗口时，这个矩形会
+    /// 从旧候选滑到新候选；`hoverRect` 仍然是"最终命中"的唯一真相。
+    /// 只动画候选框，拖拽选区始终 1:1 跟手。
+    private var hoverPresentationRect: NSRect?
+    private var hoverTween: Timer?
+    private var hoverTweenFrom: NSRect = .zero
+    private var hoverTweenTo: NSRect = .zero
+    private var hoverTweenStartedAt: CFTimeInterval = 0
+    private var hoverTweenDuration: TimeInterval = 0
+
     /// 拖拽状态（视图坐标）。
     private var anchor: NSPoint?
     private var current: NSPoint?
@@ -238,6 +255,10 @@ final class OverlayView: NSView {
     private var pendingRect: NSRect?
 
     private var trackingAreaRef: NSTrackingArea?
+    /// 提示条的局部透明度。5 秒后让它淡出，而不是在用户读到一半时整块消失。
+    private var hintAlpha: CGFloat = 1
+    private var hintFadeTimer: Timer?
+    private var isHintFading = false
 
     /// 覆盖层认的键。抽成数据是为了让「按下的是什么键」和「该做什么」
     /// 两件事能各自被查：`key(forKeyCode:)` 是纯函数，自检不用造 `NSEvent`。
@@ -274,6 +295,11 @@ final class OverlayView: NSView {
     required init?(coder: NSCoder) { fatalError("不支持归档加载") }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    deinit {
+        hoverTween?.invalidate()
+        hintFadeTimer?.invalidate()
+    }
+
     // MARK: 追踪
 
     override func updateTrackingAreas() {
@@ -301,28 +327,92 @@ final class OverlayView: NSView {
     func refreshHover(atScreenPoint point: CGPoint) {
         guard !isDragging else { return }
 
+        let next: NSRect?
         if let hit = controller?.candidateWindow(at: point) {
             let local = viewRect(fromScreenRect: hit.frameInScreenCoords)
-            hoverRect = local
+            next = local
             hoverWindow = hit.window
             hoverIsDisplay = false
         } else if let screen = screenRef {
-            hoverRect = viewRect(fromScreenRect: screen.frame)
+            next = viewRect(fromScreenRect: screen.frame)
             hoverWindow = nil
             hoverIsDisplay = true
         } else {
-            hoverRect = nil
+            next = nil
             hoverWindow = nil
             hoverIsDisplay = false
         }
-        needsDisplay = true
+
+        let old = hoverRect
+        hoverRect = next
+        guard !rectsAlmostEqual(old, next) else {
+            needsDisplay = true
+            return
+        }
+        animateHover(to: next)
     }
 
     private func clearHover() {
+        hoverTween?.invalidate()
+        hoverTween = nil
+        hoverPresentationRect = nil
         hoverRect = nil
         hoverWindow = nil
         hoverIsDisplay = false
         needsDisplay = true
+    }
+
+    private func rectsAlmostEqual(_ a: NSRect?, _ b: NSRect?) -> Bool {
+        switch (a, b) {
+        case (nil, nil): return true
+        case let (a?, b?):
+            return abs(a.minX - b.minX) < 0.5 && abs(a.minY - b.minY) < 0.5
+                && abs(a.width - b.width) < 0.5 && abs(a.height - b.height) < 0.5
+        default: return false
+        }
+    }
+
+    /// 候选框换目标时用一小段减速曲线接上去。直接跳会让"扫过一排窗口"的
+    /// 过程看起来像界面在抽搐；拖拽仍然不经过这里，所以不会牺牲框选精度。
+    private func animateHover(to target: NSRect?) {
+        hoverTween?.invalidate()
+        hoverTween = nil
+
+        guard !Motion.isReduced, hoverPresentationRect != nil, let target else {
+            hoverPresentationRect = target
+            needsDisplay = true
+            return
+        }
+
+        hoverTweenFrom = hoverPresentationRect ?? target
+        hoverTweenTo = target
+        hoverTweenStartedAt = CACurrentMediaTime()
+        hoverTweenDuration = Motion.duration(0.16)
+
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            let elapsed = CACurrentMediaTime() - self.hoverTweenStartedAt
+            let progress = self.hoverTweenDuration > 0
+                ? min(1, elapsed / self.hoverTweenDuration) : 1
+            let eased = 1 - pow(1 - progress, 3)
+            self.hoverPresentationRect = NSRect(
+                x: self.hoverTweenFrom.minX
+                    + (self.hoverTweenTo.minX - self.hoverTweenFrom.minX) * eased,
+                y: self.hoverTweenFrom.minY
+                    + (self.hoverTweenTo.minY - self.hoverTweenFrom.minY) * eased,
+                width: self.hoverTweenFrom.width
+                    + (self.hoverTweenTo.width - self.hoverTweenFrom.width) * eased,
+                height: self.hoverTweenFrom.height
+                    + (self.hoverTweenTo.height - self.hoverTweenFrom.height) * eased)
+            self.needsDisplay = true
+            if progress >= 1 {
+                timer.invalidate()
+                self.hoverTween = nil
+                self.hoverPresentationRect = self.hoverTweenTo
+            }
+        }
+        hoverTween = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     // MARK: 绘制
@@ -352,7 +442,7 @@ final class OverlayView: NSView {
     /// 当前要高亮的矩形：拖拽时是选区，否则是 hover 候选。
     private var activeRect: NSRect? {
         if isDragging { return selectionRect }
-        return hoverRect
+        return hoverPresentationRect ?? hoverRect
     }
 
     private var selectionRect: NSRect? {
@@ -447,16 +537,20 @@ final class OverlayView: NSView {
 
     /// 尺寸标签：同时给出像素尺寸和逻辑尺寸，避免用户以为截小了。
     private func drawBadge(for rect: NSRect, context: CGContext) {
+        // 候选框在缓动时，边框跟着中间帧走；角标里的尺寸却应该直接说
+        // "这一下会截到多大"。否则那串数字会在 0.16 秒里一路跳，
+        // 像在倒计时，反而不安。位置仍跟着中间帧，读数用目标帧。
+        let measured = isDragging ? rect : (hoverRect ?? rect)
         let scale = screenRef?.backingScaleFactor ?? 2
-        let pixelWidth = Int((rect.width * scale).rounded())
-        let pixelHeight = Int((rect.height * scale).rounded())
+        let pixelWidth = Int((measured.width * scale).rounded())
+        let pixelHeight = Int((measured.height * scale).rounded())
 
         var title = ""
         var subtitle = ""
 
         if isDragging {
             title = "\(pixelWidth) × \(pixelHeight)"
-            subtitle = scale > 1 ? "\(Int(rect.width))×\(Int(rect.height)) pt @\(Int(scale))x" : ""
+            subtitle = scale > 1 ? "\(Int(measured.width))×\(Int(measured.height)) pt @\(Int(scale))x" : ""
         } else if hoverIsDisplay {
             title = "整屏 \(pixelWidth) × \(pixelHeight)"
             subtitle = "单击或 ⏎ 截取全屏"
@@ -499,7 +593,13 @@ final class OverlayView: NSView {
     static let dragHintText = "按住 ⇧ 锁成正方形　·　按住 ⌥ 从中心向外扩"
 
     private func drawHintIfNeeded(context: CGContext) {
-        guard !isDragging, controller?.drawsHint(on: screenRef) == true else { return }
+        guard !isDragging else { return }
+        let controllerWantsHint = controller?.drawsHint(on: screenRef) == true
+        guard (controllerWantsHint || isHintFading), hintAlpha > 0.001 else { return }
+
+        context.saveGState()
+        context.setAlpha(hintAlpha)
+        defer { context.restoreGState() }
 
         let text = Self.hintText
         let string = NSAttributedString(string: text, attributes: [
@@ -512,11 +612,52 @@ final class OverlayView: NSView {
                          width: size.width + 36,
                          height: size.height + 18)
 
-        context.setFillColor(NSColor.black.withAlphaComponent(0.68).cgColor)
-        context.addPath(CGPath(roundedRect: box, cornerWidth: Design.Radius.card,
-                               cornerHeight: Design.Radius.card, transform: nil))
+        // 和工具栏 / 角标同一套 HUD 材质：提示条也是"压在真实内容上的浮层"，
+        // 不该比它们更透、更灰。边缘补一圈 1pt 高光，白字在纯白窗口上也立得住。
+        context.saveGState()
+        context.setShadow(offset: CGSize(width: 0, height: -2), blur: 10,
+                          color: NSColor.black.withAlphaComponent(0.30).cgColor)
+        context.setFillColor(Design.Ink.hud.cgColor)
+        let path = CGPath(roundedRect: box, cornerWidth: Design.Radius.hud,
+                          cornerHeight: Design.Radius.hud, transform: nil)
+        context.addPath(path)
         context.fillPath()
+        context.restoreGState()
+
+        context.setStrokeColor(Design.Ink.hudEdge.cgColor)
+        context.setLineWidth(1)
+        context.addPath(path)
+        context.strokePath()
         string.draw(at: NSPoint(x: box.minX + 18, y: box.minY + 9))
+    }
+
+    /// 提示条到点退场。只改这一条提示的透明度，不动压暗和候选框。
+    fileprivate func fadeHintOut() {
+        guard !isHintFading, hintAlpha > 0 else { return }
+        isHintFading = true
+        let duration = Motion.duration(0.18)
+        guard duration > 0 else {
+            hintAlpha = 0
+            isHintFading = false
+            needsDisplay = true
+            return
+        }
+
+        let startedAt = CACurrentMediaTime()
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            let progress = min(1, (CACurrentMediaTime() - startedAt) / duration)
+            self.hintAlpha = 1 - progress
+            self.needsDisplay = true
+            if progress >= 1 {
+                timer.invalidate()
+                self.hintFadeTimer = nil
+                self.isHintFading = false
+                self.hintAlpha = 0
+            }
+        }
+        hintFadeTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     /// 离屏渲染自检用：把覆盖层摆成某个状态。
@@ -526,7 +667,10 @@ final class OverlayView: NSView {
     func populateForSelfTest(hover: NSRect?, isDisplayCandidate: Bool,
                              drag: (start: NSPoint, at: NSPoint)?,
                              modifiers: NSEvent.ModifierFlags = []) {
+        hoverTween?.invalidate()
+        hoverTween = nil
         hoverRect = hover
+        hoverPresentationRect = hover
         hoverIsDisplay = isDisplayCandidate
         hoverWindow = nil
         if let drag {
@@ -592,6 +736,11 @@ final class OverlayView: NSView {
     /// 按下那一下改的全部状态。**自检走的是这一个函数**，不是另写一份 ——
     /// 否则验的是"我以为按下会怎样"，不是"按下真的怎样"。
     private func beginDrag(at point: NSPoint, option: Bool) {
+        // 拖拽一开始就停掉候选框的缓动：拖框必须逐点跟手，不能被上一段
+        // 候选动画的计时器再重绘一帧。
+        hoverTween?.invalidate()
+        hoverTween = nil
+        hoverPresentationRect = hoverRect
         anchor = point
         current = point
         isDragging = true

@@ -69,8 +69,14 @@ enum Design {
     }
 
     enum Timing {
-        static let fade = 0.14
-        static let rise = 0.2
+        /// 悬停、按下等即时回执。
+        static let micro = 0.10
+        /// 颜色、透明度这类同一空间里的状态变化。
+        static let fade = 0.16
+        /// 小面板 / 工具栏进场。
+        static let rise = 0.22
+        /// 有空间关系的浮层落位。
+        static let settle = 0.28
     }
 }
 

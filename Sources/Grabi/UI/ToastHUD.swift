@@ -44,18 +44,29 @@ final class ToastHUDController {
         card.frame = NSRect(origin: .zero, size: size)
 
         let panel = self.panel ?? makePanel(size: size)
+        // 先记下它是不是正挂在屏幕上，再动 alpha。顺序反了的话，下面那个
+        // `replacing` 会永远读到 0，换内容的角标就会重新从透明淡入。
+        let replacing = panel.isVisible && panel.alphaValue > 0.01
         panel.contentView = card
         panel.setContentSize(size)
-        panel.alphaValue = 0
         self.panel = panel
 
         let target = screen ?? Self.screenUnderMouse()
-        panel.setFrameOrigin(origin(for: panel.frame.size, in: target))
+        let targetOrigin = origin(for: panel.frame.size, in: target)
+        // 新角标从下方 10pt 滑上来；已经是同一块角标换内容时只轻轻托一下，
+        // 不再从透明重新淡入 —— 那样会在旧回执的位置闪一下。
+        if replacing {
+            panel.alphaValue = 1
+            panel.setFrameOrigin(NSPoint(x: targetOrigin.x, y: targetOrigin.y - 4))
+        } else {
+            panel.alphaValue = 0
+            panel.setFrameOrigin(NSPoint(x: targetOrigin.x, y: targetOrigin.y - 10))
+        }
         panel.orderFrontRegardless()
 
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = Motion.duration(0.16)
+        Motion.run(duration: Design.Timing.settle, curve: Motion.Curve.enter) {
             panel.animator().alphaValue = 1
+            panel.animator().setFrameOrigin(targetOrigin)
         }
 
         let work = DispatchWorkItem { [weak self] in self?.hide() }
@@ -72,6 +83,8 @@ final class ToastHUDController {
                                backing: .buffered,
                                defer: false)
         panel.isFloatingPanel = true
+        // 进场完全由 `Motion` 控制；不要系统再叠一层默认窗口动画。
+        panel.animationBehavior = .none
         panel.level = ShotLevels.toast
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -89,13 +102,14 @@ final class ToastHUDController {
         hideWorkItem = nil
         self.panel = nil
 
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = Motion.duration(0.24)
+        let current = panel.frame.origin
+        Motion.run(duration: 0.18, curve: Motion.Curve.exit) {
             panel.animator().alphaValue = 0
-        }, completionHandler: {
+            panel.animator().setFrameOrigin(NSPoint(x: current.x, y: current.y - 6))
+        } completion: {
             panel.orderOut(nil)
             panel.contentView = nil
-        })
+        }
     }
 
     private func origin(for size: NSSize, in screen: NSScreen?) -> NSPoint {
@@ -133,6 +147,8 @@ final class ToastCardView: NSView {
     }
 
     override var mouseDownCanMoveWindow: Bool { false }
+
+    private var isHovering = false
 
     init(title: String, detail: String?, thumbnail: CGImage?) {
         super.init(frame: .zero)
@@ -208,6 +224,47 @@ final class ToastCardView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("不支持归档加载") }
+
+    /// 可点的角标需要自己的悬停回执：光标变手形只是"能点"，卡面轻微提亮
+    /// 才让整张卡片像一个可以按的东西。不可点的角标保持完全静止。
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(rect: bounds,
+                                       options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    private func setHovering(_ hovering: Bool) {
+        guard onClick != nil, isHovering != hovering else { return }
+        isHovering = hovering
+        let base = Design.Ink.hud
+        let target = hovering
+            ? (base.blended(withFraction: 0.08, of: .white) ?? base)
+            : base
+        let edge = hovering
+            ? NSColor.white.withAlphaComponent(0.24)
+            : Design.Ink.hudEdge
+        guard let layer else { return }
+
+        Motion.animate(layer, keyPath: "backgroundColor",
+                       from: layer.presentation()?.backgroundColor,
+                       to: target.cgColor,
+                       duration: Design.Timing.fade,
+                       curve: Motion.Curve.move,
+                       key: "toast.hover.background")
+        Motion.animate(layer, keyPath: "borderColor",
+                       from: layer.presentation()?.borderColor,
+                       to: edge.cgColor,
+                       duration: Design.Timing.fade,
+                       curve: Motion.Curve.move,
+                       key: "toast.hover.edge")
+        layer.backgroundColor = target.cgColor
+        layer.borderColor = edge.cgColor
+    }
+
+    override func mouseEntered(with event: NSEvent) { setHovering(true) }
+    override func mouseExited(with event: NSEvent) { setHovering(false) }
 
     override func resetCursorRects() {
         if onClick != nil { addCursorRect(bounds, cursor: .pointingHand) }

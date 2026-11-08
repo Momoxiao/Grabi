@@ -481,10 +481,12 @@ final class InlinePreviewController: NSObject {
         buildPreviewPanel(for: selectionRect)
         buildToolbarPanel()
 
-        // 直接到最终状态，不做淡入：压暗层的挖空是透明的，预览 alpha 从 0
-        // 一点点升上来的这 0.14 秒里，挖空里露的是实时屏幕——就是"闪一下"。
+        // 图片本身直接到最终状态：压暗层的挖空是透明的，图片 alpha 从 0 升上来的
+        // 这零点几秒里，挖空里露的是实时屏幕——就是"闪一下"。
+        // 进场动效落在**不暴露桌面**的两处：阴影从无到有地长出来，工具栏从下方浮上来。
         previewPanel?.alphaValue = 1
         toolbarPanel?.alphaValue = 1
+        playPreviewEntrance()
 
         // 键盘通路：截图时 overlay 已经把本 app 激活了，这里让预览面板接管 key，
         // Esc / 回车 / ⌘C 才能被它接住（否则面板永远收不到键盘事件）。
@@ -895,6 +897,61 @@ final class InlinePreviewController: NSObject {
         handlesView = handles
     }
 
+    /// 截图变成预览的那一下：图片已经在最终位置，先让它的阴影柔和地落下来，
+    /// 再让工具栏从下方 8pt 浮上来。两层错开 40ms，读起来是"图片先稳住、
+    /// 操作再跟上"，而不是一块黑条和一张图同时砸在屏幕上。
+    private func playPreviewEntrance() {
+        animatePreviewShadowIn()
+
+        guard let toolbar = toolbarPanel else { return }
+        let target = toolbar.frame.origin
+        guard !Motion.isReduced else {
+            toolbar.alphaValue = 1
+            toolbar.ignoresMouseEvents = false
+            return
+        }
+
+        toolbar.alphaValue = 0
+        toolbar.ignoresMouseEvents = true
+        toolbar.setFrameOrigin(NSPoint(x: target.x, y: target.y - 8))
+        let delay = Motion.duration(0.04)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.toolbarPanel === toolbar else { return }
+            Motion.run(duration: Design.Timing.settle, curve: Motion.Curve.enter) {
+                toolbar.animator().alphaValue = 1
+                toolbar.animator().setFrameOrigin(target)
+            } completion: {
+                // 用户可能在 280ms 内就把预览拖走（钉住）。那之后工具栏已经
+                // 透明且不该再接鼠标，这里的收尾不能把它重新打开。
+                guard self.toolbarPanel === toolbar, !self.isPinned else { return }
+                toolbar.ignoresMouseEvents = false
+            }
+        }
+    }
+
+    /// 预览的阴影是"这张图离开桌面、浮起来"的唯一空间信号。
+    /// 图片不能缩放（会露出选区外的实时桌面），但阴影可以先短后长、先淡后浓。
+    private func animatePreviewShadowIn() {
+        guard let container = previewPanel?.contentView as? PreviewHoverContainer,
+              let layer = container.layer else { return }
+        layer.shadowOpacity = 0.30
+        layer.shadowRadius = 6
+        container.ambientShadow?.shadowOpacity = 0.18
+        container.ambientShadow?.shadowRadius = 12
+
+        guard !Motion.isReduced else { return }
+        Motion.animate(layer, keyPath: "shadowOpacity", from: 0, to: 0.30,
+                       duration: Design.Timing.settle, curve: Motion.Curve.enter)
+        Motion.animate(layer, keyPath: "shadowRadius", from: 1, to: 6,
+                       duration: Design.Timing.settle, curve: Motion.Curve.enter)
+        if let ambient = container.ambientShadow {
+            Motion.animate(ambient, keyPath: "shadowOpacity", from: 0, to: 0.18,
+                           duration: Design.Timing.settle, curve: Motion.Curve.enter)
+            Motion.animate(ambient, keyPath: "shadowRadius", from: 4, to: 12,
+                           duration: Design.Timing.settle, curve: Motion.Curve.enter)
+        }
+    }
+
     /// 拖动预览。第一次拖动时撤掉压暗，之后只移动面板本身。
     ///
     /// 拖动即视为"我在看别处 / 我要摆位置"，工具栏自动收起——它挡在图片下方，
@@ -938,10 +995,8 @@ final class InlinePreviewController: NSObject {
         moved.origin.y += clamped.y - displayedOrigin.y
         currentRect = moved
         layoutPreview(at: currentRect, zoom: previewZoom)
-
-        // 拖动过就隐藏工具栏：用户明确要求拖动结束后不要再留一排工具挡图。
-        toolbarPanel?.alphaValue = 0
-        toolbarPanel?.ignoresMouseEvents = true
+        // 工具栏的退场由 `pinIfNeeded()` 统一负责；这里再置一次 0 会把
+        // 刚开始的淡出切成硬切。
     }
 
     /// 滚轮缩放。**只有拖走之后才生效** —— 刚截完还没动过时滚轮不改变任何东西，
@@ -981,9 +1036,13 @@ final class InlinePreviewController: NSObject {
         previewPanel?.level = ShotLevels.pinnedPreview
         fadeOutDimPanel()
         // 从"刚截完的浮条"切成"贴在屏幕上的一张图"：工具栏会挡住要看的内容，
-        // 而这一刻起操作入口是图上右键和角落那颗「×」。
-        toolbarPanel?.alphaValue = 0
-        toolbarPanel?.ignoresMouseEvents = true
+        // 而这一刻起操作入口是图上右键和角落那颗「×」。让它退场，不是凭空消失。
+        if let toolbar = toolbarPanel {
+            toolbar.ignoresMouseEvents = true
+            Motion.run(duration: Design.Timing.fade, curve: Motion.Curve.exit) {
+                toolbar.animator().alphaValue = 0
+            }
+        }
         // 拖动进入钉住态时鼠标通常还在图上，`onHoverChanged` 不会重新触发；
         // 这里按当前 hover 状态立刻把「×」补出来，否则用户得先移出去再移回来。
         if let closeButton { setCloseButton(closeButton, visible: isHoveringPreview) }
@@ -1098,8 +1157,7 @@ final class InlinePreviewController: NSObject {
             guard let panel, panel.alphaValue < 1 else { continue }
             if animated {
                 panel.alphaValue = 0
-                NSAnimationContext.runAnimationGroup { context in
-                    context.duration = Motion.duration(0.16)
+                Motion.run(duration: Design.Timing.fade, curve: Motion.Curve.enter) {
                     panel.animator().alphaValue = 1
                 }
             } else {
@@ -1251,15 +1309,14 @@ final class InlinePreviewController: NSObject {
         dimPanels = []
         guard !panels.isEmpty else { return }
 
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = Motion.duration(0.18)
+        Motion.run(duration: 0.18, curve: Motion.Curve.exit) {
             for panel in panels { panel.animator().alphaValue = 0 }
-        }, completionHandler: {
+        } completion: {
             for panel in panels {
                 panel.orderOut(nil)
                 panel.contentView = nil
             }
-        })
+        }
     }
 
     // MARK: 工具栏
@@ -1458,9 +1515,7 @@ final class InlinePreviewController: NSObject {
             return
         }
 
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = Motion.duration(0.2)
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        Motion.run(duration: Design.Timing.rise, curve: Motion.Curve.move) {
             toolbarPanel.animator().setFrame(NSRect(origin: origin, size: size), display: true)
         }
     }
@@ -1546,9 +1601,12 @@ final class InlinePreviewController: NSObject {
         let shouldShow = visible && isPinned
         if shouldShow {
             button.isHidden = false
-            button.animator().alphaValue = 1
+            Motion.reveal(button, offset: CGSize(width: 0, height: -3),
+                          duration: Design.Timing.fade)
         } else {
-            button.animator().alphaValue = 0
+            Motion.run(duration: 0.12, curve: Motion.Curve.exit) {
+                button.animator().alphaValue = 0
+            }
             // 等淡出走完再摘事件，动画中间还能看见那一小块在褪。
             DispatchQueue.main.asyncAfter(deadline: .now() + Motion.duration(0.12)) {
                 guard button.alphaValue < 0.01 else { return }
@@ -2225,17 +2283,16 @@ final class InlinePreviewController: NSObject {
         // 的那一档，不能继承上一张拖走后的钉住态。
         isPinned = false
         zoomHintShown = false
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = Motion.duration(0.12)
+        Motion.run(duration: 0.14, curve: Motion.Curve.exit) {
             preview?.animator().alphaValue = 0
             toolbar?.animator().alphaValue = 0
             for dim in dims { dim.animator().alphaValue = 0 }
-        }, completionHandler: {
+        } completion: {
             for panel in [preview, toolbar].compactMap({ $0 }) + dims {
                 panel.orderOut(nil)
                 panel.contentView = nil
             }
-        })
+        }
 
         onClosed?(reason)
     }
@@ -2357,15 +2414,16 @@ final class ToolbarBackgroundView: NSView {
         }
 
         old.wantsLayer = true
-        newStack.alphaValue = 0
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = Motion.duration(0.16)
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        old.alphaValue = 1
+        Motion.run(duration: 0.18, curve: Motion.Curve.exit) {
             old.animator().alphaValue = 0
-            newStack.animator().alphaValue = 1
-        }, completionHandler: {
+        }
+        // 新一组从右边 5pt 滑进来，方向感说明"换档了"；旧一组原地退场，
+        // 两组不做交叉位移，避免整条浮条像在左右抖。
+        Motion.reveal(newStack, offset: CGSize(width: 5, height: 0), scale: 1,
+                      duration: 0.18) {
             old.removeFromSuperview()
-        })
+        }
     }
 }
 
@@ -2440,20 +2498,19 @@ final class ToolbarButton: NSButton {
             let target = hovering
                 ? (baseInk.blended(withFraction: 0.35, of: .white) ?? baseInk)
                 : baseInk
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = Motion.duration(Design.Timing.fade)
+            Motion.run(duration: Design.Timing.fade, curve: Motion.Curve.move) {
                 animator().contentTintColor = target
             }
         }
 
-        let animation = CABasicAnimation(keyPath: "opacity")
-        animation.fromValue = hoverLayer.presentation()?.opacity ?? hoverLayer.opacity
-        animation.toValue = hovering ? 1 : 0
-        // 走 `Motion.duration`：系统开着「减弱动态效果」时它是 0，悬停高亮直接到位。
+        // 走统一入口：系统开着「减弱动态效果」时它直接到位。
         // 这一处以前是裸的 0.12 —— 绕开了统一入口，等于这个控件不遵守系统的开关。
-        animation.duration = Motion.duration(Design.Timing.fade)
-        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        hoverLayer.add(animation, forKey: "opacity")
+        Motion.animate(hoverLayer, keyPath: "opacity",
+                       from: hoverLayer.presentation()?.opacity ?? hoverLayer.opacity,
+                       to: hovering ? 1 : 0,
+                       duration: Design.Timing.fade,
+                       curve: Motion.Curve.move,
+                       key: "toolbar.hover")
         hoverLayer.opacity = hovering ? 1 : 0
     }
 
@@ -2469,15 +2526,36 @@ final class ToolbarButton: NSButton {
     override func mouseEntered(with event: NSEvent) { setHovering(true) }
     override func mouseExited(with event: NSEvent) { setHovering(false) }
 
-    /// 鼠标按下时短暂压暗，松开恢复——按钮"被按下"的手感。
-    override func mouseDown(with event: NSEvent) {
-        hoverLayer.backgroundColor = NSColor.white.withAlphaComponent(0.22).cgColor
-        super.mouseDown(with: event)
+    /// 鼠标按下时短暂压暗并轻微内收，松开恢复——给"这一下已经收下了"一个手感。
+    /// 位移只落在 layer 上，不会让这一排按钮重新排版，旁边的按钮不会从鼠标下溜走。
+    private var isPressed = false
+
+    private func setPressed(_ pressed: Bool) {
+        guard isPressed != pressed else { return }
+        isPressed = pressed
+        hoverLayer.backgroundColor = NSColor.white
+            .withAlphaComponent(pressed ? 0.22 : 0.12).cgColor
+
+        // 压暗是反馈，缩放是空间动效；开了「减弱动态效果」就只保留前者。
+        guard !Motion.isReduced, let layer else { return }
+        let target = pressed
+            ? CATransform3DMakeScale(0.94, 0.94, 1)
+            : CATransform3DIdentity
+        let animation = CABasicAnimation(keyPath: "transform")
+        animation.fromValue = NSValue(caTransform3D: layer.transform)
+        animation.toValue = NSValue(caTransform3D: target)
+        animation.duration = Motion.duration(pressed ? Design.Timing.micro : 0.20)
+        animation.timingFunction = pressed ? Motion.Curve.exit : Motion.Curve.enter
+        layer.transform = target
+        layer.add(animation, forKey: "toolbar.press")
     }
 
-    override func mouseUp(with event: NSEvent) {
-        hoverLayer.backgroundColor = NSColor.white.withAlphaComponent(0.12).cgColor
-        super.mouseUp(with: event)
+    override func mouseDown(with event: NSEvent) {
+        setPressed(true)
+        // `NSButton` 在 `super.mouseDown` 里完成按住、跟踪、松手与发动作；
+        // 这里不要再补一遍 `mouseUp`，否则同一次点击可能被算两次。
+        super.mouseDown(with: event)
+        setPressed(false)
     }
 }
 
@@ -3317,11 +3395,34 @@ final class HoverCloseButton: NSButton {
 
     override func mouseEntered(with event: NSEvent) {
         hovered = true
-        backdrop.backgroundColor = NSColor.systemRed.withAlphaComponent(0.85).cgColor
+        setBackdropHovering(true)
     }
 
     override func mouseExited(with event: NSEvent) {
         hovered = false
-        backdrop.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
+        setBackdropHovering(false)
+    }
+
+    private func setBackdropHovering(_ hovering: Bool) {
+        let target = hovering
+            ? NSColor.systemRed.withAlphaComponent(0.85)
+            : NSColor.black.withAlphaComponent(0.55)
+        let edge = hovering
+            ? NSColor.white.withAlphaComponent(0.42)
+            : NSColor.white.withAlphaComponent(0.28)
+        Motion.animate(backdrop, keyPath: "backgroundColor",
+                       from: backdrop.presentation()?.backgroundColor,
+                       to: target.cgColor,
+                       duration: Design.Timing.fade,
+                       curve: Motion.Curve.move,
+                       key: "close.hover.background")
+        Motion.animate(backdrop, keyPath: "borderColor",
+                       from: backdrop.presentation()?.borderColor,
+                       to: edge.cgColor,
+                       duration: Design.Timing.fade,
+                       curve: Motion.Curve.move,
+                       key: "close.hover.edge")
+        backdrop.backgroundColor = target.cgColor
+        backdrop.borderColor = edge.cgColor
     }
 }
