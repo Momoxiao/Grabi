@@ -1,0 +1,23 @@
+#!/bin/bash
+#
+# 安装后验证 app 的位置和签名。签名不通过就不让安装器报“成功”，
+# 否则用户打开时才发现拿到的是坏包。
+#
+set -euo pipefail
+
+APP="/Applications/Grabi.app"
+if [[ ! -d "$APP" ]]; then
+    echo "找不到 $APP" >&2
+    exit 1
+fi
+
+if ! /usr/bin/codesign --verify --deep --strict "$APP" >/dev/null 2>&1; then
+    echo "Grabi.app 签名校验失败" >&2
+    exit 1
+fi
+
+# 本地/内部安装包不应该把下载隔离属性继续挂在 app 上；
+# 真正公开分发时仍应由 Developer ID + 公证解决，而不是靠这一步。
+/usr/bin/xattr -dr com.apple.quarantine "$APP" >/dev/null 2>&1 || true
+
+exit 0

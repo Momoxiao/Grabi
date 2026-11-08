@@ -1,0 +1,30 @@
+#!/bin/bash
+#
+# 安装前退出正在运行的版本，并清掉旧品牌和用户目录里的重复副本。
+# 这个脚本由 Installer.app 以 root 身份执行。
+#
+set -euo pipefail
+
+/usr/bin/pkill -x Grabi >/dev/null 2>&1 || true
+/bin/sleep 1
+
+# 旧品牌曾使用不同 bundle id，留在 /Applications 会继续被登录项拉起。
+/bin/rm -rf "/Applications/LiteShot.app" "/Applications/Shutterbox.app"
+
+# 当前用户目录里的 Grabi 会与 /Applications 里的版本形成第二份菜单栏进程。
+# 安装目标固定是 /Applications，所以只清理用户目录里的重复副本，不碰用户文件。
+console_user="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)"
+if [[ -n "$console_user" && "$console_user" != "root" ]]; then
+    console_home="$(
+        /usr/bin/dscl . -read "/Users/$console_user" NFSHomeDirectory 2>/dev/null \
+            | /usr/bin/awk '{print $2}'
+    )"
+    if [[ -n "$console_home" ]]; then
+        /bin/rm -rf \
+            "$console_home/Applications/Grabi.app" \
+            "$console_home/Applications/LiteShot.app" \
+            "$console_home/Applications/Shutterbox.app"
+    fi
+fi
+
+exit 0

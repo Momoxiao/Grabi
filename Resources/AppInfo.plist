@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <!-- 支持的语言。AppKit 用它决定"系统自带控件"（查找条、右键菜单、拼写面板）
+         说哪种语言：不声明就一律按开发区域（zh_CN）来，英文用户也会看到中文边栏。
+         真正的判据是 Resources 下有没有对应的 .lproj，这里再写一遍是为了
+         `plutil -p` 一眼能看出来。 -->
+    <key>CFBundleLocalizations</key>
+    <array>
+        <string>zh_Hans</string>
+        <string>en</string>
+    </array>
+    <key>CFBundleExecutable</key>
+    <string>Grabi</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.momoxiao.grabi</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Grabi</string>
+    <key>CFBundleDisplayName</key>
+    <string>Grabi 快门盒</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+
+    <!-- 关于面板里那一行。截图工具最该说清楚的一件事是数据去哪了：
+         全本地（ScreenCaptureKit + Vision），代码里没有任何网络调用。 -->
+    <key>NSHumanReadableCopyright</key>
+    <string>© 2026 momoxiao　·　截图与文字识别全部在本机完成，不上传任何数据</string>
+
+    <!-- 菜单栏应用：不显示 Dock 图标，不出现在 ⌘Tab 里 -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Grabi 需要屏幕录制权限才能截取屏幕内容。</string>
+</dict>
+</plist>

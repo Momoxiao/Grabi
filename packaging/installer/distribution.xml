@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="1">
+    <title>Grabi 安装器</title>
+    <organization>com.momoxiao</organization>
+    <domains enable_localSystem="true"/>
+    <options customize="never" require-scripts="true" hostArchitectures="arm64,x86_64"/>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <readme file="readme.html" mime-type="text/html"/>
+    <license file="license.txt" mime-type="text/plain"/>
+    <choices-outline>
+        <line choice="default"/>
+    </choices-outline>
+    <choice id="default" visible="false">
+        <pkg-ref id="com.momoxiao.grabi.installer"/>
+    </choice>
+    <pkg-ref id="com.momoxiao.grabi.installer"
+             version="@VERSION@"
+             onConclusion="none">Grabi-component.pkg</pkg-ref>
+</installer-gui-script>

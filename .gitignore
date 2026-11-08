@@ -1,0 +1,33 @@
+# Swift / SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# 构建产物
+dist/
+*.dmg
+*.zip
+
+# DMG 安装窗口的背景图，由 tools/make-dmg-background.swift 生成
+packaging/dmg/background.png
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Xcode（若用 Xcode 打开）
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+*.xcuserstate
+
+# 本地签名身份记录（每台机器不同，不该提交）
+.build/.last-sign-identity
+
+# 本地工具产物（Playwright 截图、调试图片、会话状态）
+.dsh-progress/
+.playwright-cli/
+output/
+generated-images/

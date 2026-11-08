@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  后台保活 Agent。
+
+  打包进 Grabi.app/Contents/Library/LaunchAgents/，由
+  SMAppService.agent(plistName:) 交给系统守护进程托管。
+
+  用 BundleProgram（bundle 内相对路径）而不是 ProgramArguments（绝对路径）：
+  这是 bundle 内 agent 的要求，也让 app 被移动到任何位置后依然有效。
+
+  KeepAlive 故意不用 true，而是 { SuccessfulExit = false }：
+  只有崩溃（非 0 退出）才重启，用户主动退出不会被强行拉起来。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.momoxiao.grabi.keepalive</string>
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/Grabi</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+</dict>
+</plist>

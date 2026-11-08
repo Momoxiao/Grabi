@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+    <meta charset="utf-8">
+    <style>
+        body {
+            font: 13px -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+            color: #1d1d1f;
+            line-height: 1.55;
+            margin: 0;
+        }
+        h2 {
+            font-size: 17px;
+            font-weight: 600;
+            margin: 0 0 10px;
+        }
+        h3 {
+            font-size: 14px;
+            font-weight: 600;
+            margin: 16px 0 6px;
+        }
+        p, li {
+            margin: 0 0 6px;
+        }
+        ul {
+            margin: 0 0 10px 20px;
+            padding: 0;
+        }
+        code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        }
+        .muted {
+            color: #6e6e73;
+        }
+    </style>
+</head>
+<body>
+    <h2>安装说明</h2>
+    <ol>
+        <li>继续完成安装，安装器会把 Grabi 放到 <code>/Applications</code>。</li>
+        <li>安装完成后打开 Grabi，并按提示授予“屏幕录制”权限。</li>
+        <li>授权后完全退出 Grabi，再重新打开一次。</li>
+    </ol>
+
+    <h3>授权路径</h3>
+    <p><code>系统设置 → 隐私与安全性 → 屏幕与系统音频录制</code></p>
+
+    <h3>首次打开被系统拦截时</h3>
+    <p>当前 <code>Grabi.app</code> 使用 Apple Development 证书签名，安装器本身
+       尚未使用 Developer ID Installer 签名，也尚未完成 Apple 公证。请右键应用或
+       安装包 →“打开”→ 再确认一次；必要时进入“系统设置 → 隐私与安全性”点击“仍要打开”。</p>
+
+    <h3>旧版本清理</h3>
+    <p>安装器会在安装前退出正在运行的 Grabi，并清理旧的 LiteShot、Shutterbox，
+       以及用户目录里的重复 Grabi 副本，避免两个版本同时启动。</p>
+
+    <p class="muted">Grabi 是菜单栏应用，不显示 Dock 图标。安装完成后请查看菜单栏右侧的取景框图标。</p>
+</body>
+</html>

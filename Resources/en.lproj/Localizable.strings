@@ -1,0 +1,4 @@
+/*
+  See the zh-Hans.lproj copy: this file exists so the bundle declares English
+  support too, which keeps the app correct on an English-locale system.
+*/

@@ -1,0 +1,15 @@
+{
+  "file": "grabi-appicon.png",
+  "path": "/Users/momoxiao/Documents/LiteShot/assets/generated/grabi-appicon.png",
+  "prompt": "Minimalist mature macOS app icon for Grabi: one centered geometric shutter-aperture symbol made from five substantial curved blades on a dark graphite rounded-square tile, matte finish, off-white blades, one muted rust-orange blade and a small cool cyan accent, refined native macOS 14 icon, flat-to-low-relief geometric design, no text.",
+  "model": "gpt-image-2.5",
+  "size": "1024x1024",
+  "mediaType": "image/png",
+  "bytes": 1169617,
+  "width": 1024,
+  "height": 1024,
+  "seed": null,
+  "source": "assets/icon-candidates/mature-5/01-graphite-aperture.png",
+  "createdAt": "2026-10-08T02:37:00.000Z",
+  "sha256": "f36708171538ca27ad559cccd945a7416115d0de0997ed38360adc471a1ab714"
+}
