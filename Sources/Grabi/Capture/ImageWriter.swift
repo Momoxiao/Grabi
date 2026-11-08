@@ -18,8 +18,13 @@ enum ImageWriter {
     ///
     /// - Parameter sourceRect: 选区在屏幕坐标系里的位置。倍率要按**被截的那块屏**算，
     ///   传了它才能在外接 1x 屏上写出 72dpi 而不是 144dpi；不传退回主屏。
+    /// - Parameter scale: 直接指定倍率，优先于 `sourceRect`。用户把预览面板拖到
+    ///   另一块缩放比不同的屏上再按「保存」时，`sourceRect` 已经是新屏的位置，
+    ///   按它推断会把 1x 屏截的图写成 144dpi（插进文档凭空大一倍）。调用方知道
+    ///   抓图时那块屏的倍率时应该传它。
     @discardableResult
-    static func write(_ image: CGImage, type: String, sourceRect: NSRect? = nil) throws -> URL {
+    static func write(_ image: CGImage, type: String, sourceRect: NSRect? = nil,
+                      scale: CGFloat? = nil) throws -> URL {
         let settings = SettingsStore.shared
         let dir = settings.saveDirectoryURL
 
@@ -44,6 +49,8 @@ enum ImageWriter {
                                                          utType(for: format).identifier as CFString,
                                                          1,
                                                          nil) else {
+            // 某些失败路径也会先建出一个空文件；别把它留在截图目录里。
+            try? FileManager.default.removeItem(at: url)
             throw CaptureError.writeFailed("无法创建图像输出目标")
         }
 
@@ -52,12 +59,17 @@ enum ImageWriter {
             properties[kCGImageDestinationLossyCompressionQuality] = settings.jpegQuality
         }
         // 写入正确的 DPI，别让别的 app 按 72dpi 放大显示
-        let scale = sourceRect.map { ScreenGeometry.scale(of: $0) }
+        let resolvedScale = scale
+            ?? sourceRect.map { ScreenGeometry.scale(of: $0) }
             ?? NSScreen.main?.backingScaleFactor ?? 2
-        applyDPI(scale: scale, to: &properties)
+        applyDPI(scale: resolvedScale, to: &properties)
 
         CGImageDestinationAddImage(dest, image, properties as CFDictionary)
         guard CGImageDestinationFinalize(dest) else {
+            // 目标文件在 Create 那一步就已经建出来了。Finalize 失败会留下一个
+            // 0 字节/半截的 .png：用户在截图目录里看到一张打不开的图，而且下次
+            // 保存同名还会被它挤成 -2。失败就把残片删掉。
+            try? FileManager.default.removeItem(at: url)
             throw CaptureError.writeFailed("图像编码失败")
         }
 
@@ -65,7 +77,7 @@ enum ImageWriter {
         return url
     }
 
-    /// 覆盖写入（用于就地预览调整选区后重新截取并保存）。
+    /// 覆盖写入（用于就地预览调整选区后重新裁切并保存）。
     ///
     /// 编码格式**跟着目标文件的扩展名走**，而不是当前设置：截图后用户可能改过格式，
     /// 若按新格式编码却写回旧扩展名的文件，就会出现「JPEG 数据装进 .png」这种错位。
@@ -77,12 +89,20 @@ enum ImageWriter {
         let format = ImageFormat.allCases
             .first { $0.fileExtension.caseInsensitiveCompare(url.pathExtension) == .orderedSame }
             ?? SettingsStore.shared.imageFormat
-        // 覆盖写必须把原文件自带的 DPI 带上。预览里改选区重截走这条路，
+        // 覆盖写必须把原文件自带的 DPI 带上。预览里改选区重裁走这条路，
         // 以前一个 DPI 都不写，图就打回 72dpi —— 同一张截图裁一刀再插进文档，
         // 尺寸凭空大一倍。原文件没标注（不是本 app 写的）就不猜，保持不标注。
         // 读要在建目标之前：目标一旦创建，旧内容随时可能没了。
         let carriedDPI = dpi ?? existingDPI(at: url)
-        guard let dest = CGImageDestinationCreateWithURL(url as CFURL,
+        // 编码先写到同目录的临时文件，成功后再原子替换目标。以前直接开目标文件：
+        // Create 那一步就把旧图清空，后面任何一步失败（磁盘满、编码器拒绝、
+        // 进程被杀）都会让用户手里那张「原图」凭空消失 —— 而这次覆盖写的
+        // 前提恰恰是原图还要能找回来。
+        let directory = url.deletingLastPathComponent()
+        let ext = url.pathExtension.isEmpty ? format.fileExtension : url.pathExtension
+        let tempURL = directory.appendingPathComponent(".grabi-\(UUID().uuidString).\(ext)")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        guard let dest = CGImageDestinationCreateWithURL(tempURL as CFURL,
                                                          utType(for: format).identifier as CFString,
                                                          1,
                                                          nil) else {
@@ -99,6 +119,15 @@ enum ImageWriter {
         CGImageDestinationAddImage(dest, image, properties as CFDictionary)
         guard CGImageDestinationFinalize(dest) else {
             throw CaptureError.writeFailed("图像编码失败")
+        }
+        do {
+            if FileManager.default.fileExists(atPath: url.path) {
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: tempURL)
+            } else {
+                try FileManager.default.moveItem(at: tempURL, to: url)
+            }
+        } catch {
+            throw CaptureError.writeFailed(error.localizedDescription)
         }
         return url
     }
@@ -142,10 +171,14 @@ enum ImageWriter {
     /// 同名 `.txt` 是附属品，尽力而为：主图已经移走，旁车挪不动不值得把成功说成失败。
     static func discard(_ url: URL) throws {
         let fm = FileManager.default
-        // 已经不在了（重复点、或别的东西挪走了）不算失败：没东西可丢，也没什么要谎报。
-        guard fm.fileExists(atPath: url.path) else { return }
-        _ = try trash(url)
         let txtURL = textURL(alongside: url)
+        // 图片已经被别的东西删掉，但同名 .txt 还在：这也是这张截图留下的东西，
+        // 「丢弃」应该把它一起清掉，否则截图目录里会永远躺着一条无主文本。
+        guard fm.fileExists(atPath: url.path) else {
+            if fm.fileExists(atPath: txtURL.path) { _ = try? trash(txtURL) }
+            return
+        }
+        _ = try trash(url)
         if fm.fileExists(atPath: txtURL.path) {
             _ = try? trash(txtURL)
         }

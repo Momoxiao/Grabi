@@ -110,10 +110,21 @@ enum HUDBadge {
         let boxSize = size(of: rows)
         var origin = NSPoint(x: rect.minX, y: rect.minY - boxSize.height - outsideGap)
         if origin.y < bounds.minY + screenMargin { origin.y = rect.maxY + outsideGap }
-        origin.x = min(max(origin.x, bounds.minX + screenMargin),
-                       bounds.maxX - boxSize.width - screenMargin)
-        origin.y = min(max(origin.y, bounds.minY + screenMargin),
-                       bounds.maxY - boxSize.height - screenMargin)
+        // 角标比整块画布还宽 / 高时，`maxX - boxSize.width - margin` 会小于左边距。
+        // 那种情况下 `min(max(...))` 会把原点推到画布外，整条文字从左边被裁掉；
+        // 贴住左上角至少保证开头那几个字看得见（内容本身不做截断）。
+        if boxSize.width > bounds.width - screenMargin * 2 {
+            origin.x = bounds.minX + screenMargin
+        } else {
+            origin.x = min(max(origin.x, bounds.minX + screenMargin),
+                           bounds.maxX - boxSize.width - screenMargin)
+        }
+        if boxSize.height > bounds.height - screenMargin * 2 {
+            origin.y = bounds.minY + screenMargin
+        } else {
+            origin.y = min(max(origin.y, bounds.minY + screenMargin),
+                           bounds.maxY - boxSize.height - screenMargin)
+        }
 
         let box = NSRect(origin: origin, size: boxSize)
         context.setFillColor(Design.Ink.badge.cgColor)

@@ -69,6 +69,55 @@ enum CaptureError: LocalizedError {
     }
 }
 
+/// 一张整屏原图：屏幕上那一帧的原生像素，加上它对应的屏幕几何。
+///
+/// 区域、窗口、整屏三种截图都从这张原图上裁；预览里拖边框改选区时也从它裁，
+/// **不会再去抓一次屏**。画面因此永远停在按下快门的那一帧——底下的窗口、
+/// 网页在这之后变了，用户改大改小看到的还是原来那张。
+struct ScreenCapture {
+    let image: CGImage
+    /// 抓图时该屏幕在 AppKit 全局坐标里的 frame（原点主屏左下）。
+    let screenFrame: CGRect
+    /// 图像像素 / 屏幕点。横竖分开存：正常抓图两者相同，但显示器旋转、
+    /// 录屏带回读的黑边等情况下未必一致，混用会让裁切在纵向错位。
+    let scaleX: CGFloat
+    let scaleY: CGFloat
+
+    /// 写文件 DPI 用的倍率。DPI 只有一个数，取横向（正常情况两者相等）。
+    var scale: CGFloat { scaleX }
+
+    init(image: CGImage, screen: NSScreen) {
+        self.init(image: image,
+                  screenFrame: screen.frame,
+                  scaleX: CGFloat(image.width) / max(screen.frame.width, 1),
+                  scaleY: CGFloat(image.height) / max(screen.frame.height, 1))
+    }
+
+    /// 自检用：不依赖真实屏幕。
+    init(image: CGImage, screenFrame: CGRect, scale: CGFloat) {
+        self.init(image: image, screenFrame: screenFrame, scaleX: scale, scaleY: scale)
+    }
+
+    init(image: CGImage, screenFrame: CGRect, scaleX: CGFloat, scaleY: CGFloat) {
+        self.image = image
+        self.screenFrame = screenFrame
+        self.scaleX = max(scaleX, 0.01)
+        self.scaleY = max(scaleY, 0.01)
+    }
+
+    /// 按屏幕坐标（原点左下）从原图里裁一块；越界部分自动夹到图内。
+    func crop(to rectInScreen: CGRect) -> CGImage? {
+        let pixelRect = CaptureEngine.pixelRect(of: rectInScreen,
+                                                in: screenFrame,
+                                                scaleX: scaleX,
+                                                scaleY: scaleY)
+        let bounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        let clamped = pixelRect.intersection(bounds)
+        guard !clamped.isNull, clamped.width >= 1, clamped.height >= 1 else { return nil }
+        return image.cropping(to: clamped)
+    }
+}
+
 /// 截图引擎。
 ///
 /// 用 ScreenCaptureKit（走 GPU 合成管线），比老的 `CGWindowListCreateImage`
@@ -118,9 +167,7 @@ final class CaptureEngine {
     /// 抓取整块显示器，输出为显示器原生像素尺寸（Retina 上是 2x）。
     ///
     /// - Parameter excludingWindowIDs: 要从画面里**排除**的窗口。
-    ///   重新截取时必须把 Grabi 自己的窗口（预览面板、工具栏、压暗层）
-    ///   排除掉——否则会被拍进去。排除而不是"先藏再抓"的原因很实际：
-    ///   藏了就得等系统合成完再抓，那 200ms 里用户眼前是空的，会闪一下。
+    ///   例如 Grabi 自己的浮层——不排除的话会被拍进画面。
     func captureDisplay(containing screen: NSScreen,
                         excludingWindowIDs: [CGWindowID] = []) async throws -> CGImage {
         guard Permissions.hasScreenRecording else { throw CaptureError.noScreenRecording }
@@ -156,29 +203,27 @@ final class CaptureEngine {
     ///
     /// 做法是整屏抓取后本地裁剪，而不是用 `SCStreamConfiguration.sourceRect`：
     /// sourceRect 的坐标系语义在不同版本上不一致（点 / 像素），整屏抓 + 裁
-    /// 在任何缩放组合下都稳定正确，代价只是一次临时内存占用。
+    /// 在任何缩放组合下都稳定正确。
+    ///
+    /// 返回值里的 `source` 是那张**整屏原图**：预览面板要把它留着，
+    /// 用户随后拖边框改选区时从原图上重新裁，不再抓第二次屏。
     func captureRegion(_ rectInScreen: CGRect,
                        on screen: NSScreen,
-                       excludingWindowIDs: [CGWindowID] = []) async throws -> CGImage {
+                       excludingWindowIDs: [CGWindowID] = []) async throws
+        -> (image: CGImage, source: ScreenCapture) {
         guard rectInScreen.width >= 1, rectInScreen.height >= 1 else {
             throw CaptureError.emptySelection
         }
 
         let full = try await captureDisplay(containing: screen,
                                             excludingWindowIDs: excludingWindowIDs)
-        let scale = CGFloat(full.width) / max(screen.frame.width, 1)
+        let source = ScreenCapture(image: full, screen: screen)
 
-        let pixelRect = Self.pixelRect(of: rectInScreen, in: screen.frame, scale: scale)
-
-        let bounds = CGRect(x: 0, y: 0, width: full.width, height: full.height)
-        let clamped = pixelRect.intersection(bounds)
-        guard !clamped.isNull, clamped.width >= 1, clamped.height >= 1 else {
-            throw CaptureError.emptySelection
+        guard let cropped = source.crop(to: rectInScreen) else {
+            throw CaptureError.cropFailed
         }
-
-        guard let cropped = full.cropping(to: clamped) else { throw CaptureError.cropFailed }
         Log.capture.info("区域 \(cropped.width)×\(cropped.height) px")
-        return cropped
+        return (cropped, source)
     }
 
     /// 全局屏幕坐标（原点主屏左下）→ 该显示器图像里的像素矩形（原点该屏左上）。
@@ -189,10 +234,19 @@ final class CaptureEngine {
     /// 还要乘 Retina 倍率。而它原先长在 `captureRegion` 里，
     /// 没有显示器 + 没有录屏权限就一行都验不了。
     static func pixelRect(of rect: CGRect, in screenFrame: CGRect, scale: CGFloat) -> CGRect {
-        CGRect(x: (rect.minX - screenFrame.minX) * scale,
-               y: (screenFrame.maxY - rect.maxY) * scale,
-               width: rect.width * scale,
-               height: rect.height * scale).integral
+        pixelRect(of: rect, in: screenFrame, scaleX: scale, scaleY: scale)
+    }
+
+    /// 横向、纵向倍率分开的版本。正常抓图两者相等；分开传是为了让
+    /// 非等比图像（旋转屏、带黑边的采集、自检合成图）也不在纵向裁错。
+    static func pixelRect(of rect: CGRect,
+                          in screenFrame: CGRect,
+                          scaleX: CGFloat,
+                          scaleY: CGFloat) -> CGRect {
+        CGRect(x: (rect.minX - screenFrame.minX) * scaleX,
+               y: (screenFrame.maxY - rect.maxY) * scaleY,
+               width: rect.width * scaleX,
+               height: rect.height * scaleY).integral
     }
 
     /// 从一张已捕获的图里裁出局部（部分识别走这条路）。

@@ -42,6 +42,15 @@ final class StatusBarController: NSObject, NSMenuDelegate, NSMenuItemValidation 
 
     func setVisible(_ visible: Bool) {
         statusItem.isVisible = visible
+        // 图标被藏起来的那段时间里，权限状态也可能已经变了；重新露出来时不能
+        // 还挂着上一次的图标。缺权限时把警示补上，权限已经拿到时把警示撤掉。
+        if visible {
+            if Permissions.hasScreenRecording {
+                clearPermissionWarningIfNeeded()
+            } else {
+                showPermissionWarning()
+            }
+        }
         Log.ui.debug("菜单栏图标可见性: \(visible)")
     }
 

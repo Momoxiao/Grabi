@@ -50,6 +50,10 @@ final class ShotOverlayController {
     /// 覆盖层当前是否开着（用于避免热键重复触发）。
     var isActive: Bool { isPresenting }
 
+    /// 覆盖层当前的窗口号。抓图时交给 `SCContentFilter` 排除——
+    /// 正常截图时覆盖层要一直留到抓完，屏幕上才不会先亮一下实时桌面。
+    var windowIDs: [CGWindowID] { windows.map { CGWindowID($0.windowNumber) } }
+
     /// 操作提示是否还该画。
     ///
     /// 提示必须**持续显示**到用户第一次按下鼠标（或过一会儿自己收），
@@ -58,6 +62,9 @@ final class ShotOverlayController {
     private var isHintVisible = false
     /// 提示只挂在鼠标所在的那块屏上，多屏同时挂三份就是三份噪音。
     private weak var hintScreen: NSScreen?
+    /// 5 秒后自动收提示的排程。上一轮的定时器必须在新一轮开始时取消：
+    /// 否则用户 5 秒内连截两张，第二张的提示会被第一张的定时器提前收掉。
+    private var hintHideWorkItem: DispatchWorkItem?
 
     // MARK: - 开始 / 结束
 
@@ -67,6 +74,8 @@ final class ShotOverlayController {
         self.isPresenting = true
         self.didFinish = false
         self.isHintVisible = false
+        self.hintHideWorkItem?.cancel()
+        self.hintHideWorkItem = nil
         self.hintScreen = nil
 
         // 先取窗口列表，再铺覆盖层 —— 否则会把覆盖层自己也算成候选窗口。
@@ -77,6 +86,9 @@ final class ShotOverlayController {
                 Log.capture.error("获取窗口列表失败: \(error.localizedDescription)")
                 self.candidates = []
             }
+            // 取窗口列表是异步的；这期间可能已经被取消（退出、或调用方收尾）。
+            // 已经结束的这一次不能再把覆盖层铺上来。
+            guard self.isPresenting, !self.didFinish else { return }
             self.presentOverlays()
         }
     }
@@ -89,6 +101,7 @@ final class ShotOverlayController {
                                        defer: false,
                                        screen: screen)
             window.setFrame(screen.frame, display: false)
+            window.animationBehavior = .none
             window.level = ShotLevels.overlay
             window.isOpaque = false
             window.backgroundColor = .clear
@@ -121,9 +134,10 @@ final class ShotOverlayController {
 
         hintScreen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
         isHintVisible = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            self?.hideHint()
-        }
+        hintHideWorkItem?.cancel()
+        let hide = DispatchWorkItem { [weak self] in self?.hideHint() }
+        hintHideWorkItem = hide
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: hide)
     }
 
     /// 某块屏上是否还要画操作提示。
@@ -139,6 +153,8 @@ final class ShotOverlayController {
 
     fileprivate func hideHint() {
         guard isHintVisible else { return }
+        hintHideWorkItem?.cancel()
+        hintHideWorkItem = nil
         isHintVisible = false
         for window in windows {
             (window.contentView as? OverlayView)?.needsDisplay = true
@@ -146,6 +162,8 @@ final class ShotOverlayController {
     }
 
     func dismiss() {
+        hintHideWorkItem?.cancel()
+        hintHideWorkItem = nil
         for window in windows { window.orderOut(nil) }
         windows.removeAll()
         isPresenting = false
@@ -158,10 +176,11 @@ final class ShotOverlayController {
 
         let callback = completion
         completion = nil
-        dismiss()
 
-        // 覆盖层刚撤掉时系统还在合成，立刻抓图可能把遮罩拍进去。
-        // 交给调用方延迟一帧更稳，这里只负责回调。
+        // 只有取消才立刻撤。正常截图把覆盖层留到调用方抓完图——
+        // 先撤的话，松手到预览出现之间会露出实时桌面，就是「松手闪一下」。
+        // 抓图时用 `windowIDs` 把覆盖层排除在画面之外。
+        if case .cancelled = outcome { dismiss() }
         callback?(outcome)
     }
 

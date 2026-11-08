@@ -24,18 +24,33 @@ enum PasteboardWrite {
                            to pasteboard: NSPasteboard = .general) -> Bool {
         let before = pasteboard.changeCount
         guard tiff != nil || png != nil else { return false }
+
+        // 路径可能在上次保存之后被用户删掉 / 挪走。只凭 `fileURL != nil` 就声明
+        // `.fileURL`，粘到 Finder 里会得到一个坏链接 —— 比只给位图更糟。
+        let existingFileURL = fileURL.flatMap {
+            FileManager.default.fileExists(atPath: $0.path) ? $0 : nil
+        }
+
         guard pasteboard.clearContents() != 0 else { return false }
-        var types: [NSPasteboard.PasteboardType] = [.tiff, .png]
-        if fileURL != nil { types.append(.fileURL) }
+        // 只声明真的会写数据的那几种。以前无论 tiff/png 有没有都先声明两份，
+        // 缺的那一份会留下一个"有类型、没内容"的槽位；某些 app 会挑中它，粘出来空白。
+        var types: [NSPasteboard.PasteboardType] = []
+        if tiff != nil { types.append(.tiff) }
+        if png != nil { types.append(.png) }
+        if existingFileURL != nil { types.append(.fileURL) }
         // `declareTypes` 在这套 SDK 上返回的是 Int（新的 changeCount，0 = 没声明上），
         // 不是文档里写的 Bool —— 编译器说的算。
         guard pasteboard.declareTypes(types, owner: nil) != 0 else { return false }
-        var wrote = false
-        if let tiff { wrote = pasteboard.setData(tiff, forType: .tiff) || wrote }
-        if let png { wrote = pasteboard.setData(png, forType: .png) || wrote }
-        if let fileURL { wrote = pasteboard.setString(fileURL.absoluteString, forType: .fileURL) || wrote }
-        guard wrote else { return false }
+        var wroteImage = false
+        if let tiff { wroteImage = pasteboard.setData(tiff, forType: .tiff) || wroteImage }
+        if let png { wroteImage = pasteboard.setData(png, forType: .png) || wroteImage }
+        let wroteFileURL = existingFileURL.map {
+            pasteboard.setString($0.absoluteString, forType: .fileURL)
+        } ?? true
+        guard wroteImage, wroteFileURL else { return false }
+        let expectedFileURL = existingFileURL?.absoluteString
         return verifyImage(on: pasteboard, changedFrom: before)
+            && (expectedFileURL == nil || pasteboard.string(forType: .fileURL) == expectedFileURL)
     }
 
     /// 回读：那份字必须原样读得回来，且 changeCount 真的动过。

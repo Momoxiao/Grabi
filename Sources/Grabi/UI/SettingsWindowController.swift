@@ -83,6 +83,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     required init?(coder: NSCoder) { fatalError("不支持归档加载") }
 
     func present() {
+        // 「恢复默认快捷键」的结果行说的是"刚刚那次操作"；重新打开设置时它已经
+        // 不是刚发生了。`refresh()` 会清语言那行，这一行也得在开场时归零。
+        hotKeyStatusLabel?.stringValue = ""
         refresh()
         showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -364,8 +367,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                         display: true, animate: animate && !Motion.isReduced)
         // 换面板回到顶部：从最长的「快捷键」切回短的「保存」时，若停在原来的滚动位置，
         // 窗口会开在一片空白上。
+        //
+        // `contentHost` 是普通 NSView（非 flipped），所以文档坐标的 `.zero` 是**底边**
+        // 不是顶边 —— 直接 `scroll(to: .zero)` 会让切换后停在内容底部。这里按文档高
+        // 和可见高算出顶边；文档比可见区矮时 top = 0（没有可滚的）。
+        window.contentView?.layoutSubtreeIfNeeded()
         let clip = paneScroll.contentView
-        clip.scroll(to: .zero)
+        // 用目标高度算可见区，而不是读 clip 的当前高度：换页动画还没跑完时
+        // 后者还是上一页的尺寸，会把顶部算歪。
+        let visibleHeight = max(1, plan.height - max(chrome, 0))
+        let top = contentHost.isFlipped ? 0 : max(0, needed - visibleHeight)
+        clip.scroll(to: NSPoint(x: 0, y: top))
         paneScroll.reflectScrolledClipView(clip)
     }
 
@@ -498,6 +510,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         namePatternField?.stringValue = text
         updateNameExample()
         showPane(at: switcher.selectedSegment, animate: false)
+    }
+
+    /// 自检用：走用户提交文件名格式的**同一条路径**，返回真正写进偏好的值。
+    /// 先垫一个非空哨兵，避免"本来就存的是空串"让清空测试变成恒真；结束后
+    /// 字段和偏好都还原，自检不该改用户的设置。
+    func persistedNamePatternForSelfTest(_ text: String) -> String {
+        let oldPattern = settings.fileNamePattern
+        let oldText = namePatternField.stringValue
+        settings.fileNamePattern = "Grabi-selftest-before"
+        namePatternField.stringValue = text
+        namePatternChanged()
+        let persisted = settings.fileNamePattern
+        settings.fileNamePattern = oldPattern
+        namePatternField.stringValue = oldText
+        updateNameExample()
+        showPane(at: switcher.selectedSegment, animate: false)
+        return persisted
     }
 
     /// 离屏渲染自检用：示例标签**按当前宽度**需要多高、实际给了多高。
@@ -1324,7 +1353,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func namePatternChanged() {
         let trimmed = namePatternField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty { settings.fileNamePattern = trimmed }
+        // 留空是一条**明确的选择**，不是"什么都没改"：示例行承诺了「退回默认名
+        // Grabi」（`sanitize("")` 也确实给 Grabi），所以这里必须把空串写进偏好。
+        // 以前用 `if !trimmed.isEmpty` 挡了一下，于是清空输入框后 label 说"会退回默认"，
+        // 下一张截图却仍然按旧模板命名 —— 提示和实际行为分家。
+        settings.fileNamePattern = trimmed
         updateNameExample()
         // 示例折行数变了 → 面板高度变了。不重新量一次，窗口还是旧高度，
         // 多出来的那几行就压在窗口外面（内容驱动高度这件事，改内容就得重算）。
@@ -1598,6 +1631,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @objc private func resetPermission() {
         if Permissions.resetScreenRecordingRecord() {
             Permissions.presentResetDone()
+        } else {
+            // 重置失败时不能什么都不发生：`ensureScreenRecording` 在"权限已经
+            // 拿到"的机器上会直接返回 true，等于还是静默。这里必须明说失败，
+            // 并给出下一步（手动去系统设置里删掉旧记录）。
+            presentInfo("没能重置权限记录",
+                        "系统没有接受这次重置。请打开「系统设置 › 隐私与安全性 › "
+                            + "屏幕与系统音频录制」，手动移除 Grabi 后重新添加并授权。")
         }
         updatePermissionLabel()
     }
@@ -1615,7 +1655,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         let trimmed = namePatternField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty { settings.fileNamePattern = trimmed }
+        // 和 `namePatternChanged` 同一条规则：清空 = 用默认名，不能因为窗口关闭
+        // 这条兜底路径又把它当成"没改过"跳过。
+        settings.fileNamePattern = trimmed
         if let window { WindowFrameMemory.save(window, name: "settings") }
     }
 

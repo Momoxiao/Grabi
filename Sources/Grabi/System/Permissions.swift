@@ -133,15 +133,24 @@ enum Permissions {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
         process.arguments = ["reset", "ScreenCapture", bundleID]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
+        // tccutil 正常没有输出；仍不要留一个没人读的 Pipe —— 输出一多就会在
+        // waitUntilExit 上互相等死。直接接到空设备。
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
 
         do {
             try process.run()
             process.waitUntilExit()
             Log.system.notice("已重置屏幕录制授权记录，退出码 \(process.terminationStatus)")
+            guard process.terminationStatus == 0 else { return false }
+            // 「重置权限记录」的完成说明承诺：重开 app 后系统会重新弹授权框。
+            // 但 `promptPermissionOnceIfNeeded` 看到 didOnboard=true 会直接走
+            // 「已经引导过，不再重复弹窗」，只亮菜单栏警告 —— 所以这里必须把
+            // 首次引导标记和冷却时间一起清掉，下一轮启动才会真的调用系统授权请求。
             UserDefaults.standard.set(0, forKey: Key.promptCount)
-            return process.terminationStatus == 0
+            UserDefaults.standard.set(0, forKey: Key.lastPromptAt)
+            UserDefaults.standard.set(false, forKey: Key.didOnboard)
+            return true
         } catch {
             Log.system.error("tccutil 执行失败: \(error.localizedDescription)")
             return false

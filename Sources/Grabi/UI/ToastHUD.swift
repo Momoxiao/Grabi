@@ -122,7 +122,15 @@ private final class ToastPanel: NSPanel {
 /// internal 是给离屏渲染自检用的（`UIRenderSelfTest` 要把它真的画出来看截断）。
 final class ToastCardView: NSView {
 
-    var onClick: (() -> Void)?
+    var onClick: (() -> Void)? {
+        didSet {
+            // tooltip 不能在 init 里算：`onClick` 是调用方在 `ToastCardView`
+            // 初始化**之后**才挂上的，那时初值永远是 nil —— 于是可点的卡片
+            // 永远没有「点击打开这张截图」这句提示，用户只知道它能看，不知道能点。
+            toolTip = onClick == nil ? nil : "点击打开这张截图"
+            window?.invalidateCursorRects(for: self)
+        }
+    }
 
     override var mouseDownCanMoveWindow: Bool { false }
 
@@ -133,7 +141,6 @@ final class ToastCardView: NSView {
         layer?.cornerRadius = Design.Radius.hud
         layer?.borderWidth = 1
         layer?.borderColor = Design.Ink.hudEdge.cgColor
-        toolTip = onClick == nil ? nil : "点击打开这张截图"
         // 角标停三秒多，读屏用户更需要"内容一次报全"，而不是逐个标签去摸
         setAccessibilityLabel([title, detail].compactMap { $0 }.joined(separator: "，"))
         setAccessibilityRole(.group)
@@ -212,7 +219,10 @@ final class ToastCardView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         guard let onClick, bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
-        onClick()
+        // 先收掉当前角标，再执行点击动作。反过来的话，`onClick` 里打开失败会
+        // 用 `ToastHUDController.show` 弹一条新的失败说明，紧接着这里那句
+        // `hide()` 又把新角标收掉 —— 用户点了一下，失败原因一闪都没看见。
         ToastHUDController.shared.hide()
+        onClick()
     }
 }

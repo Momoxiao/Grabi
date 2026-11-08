@@ -108,7 +108,8 @@ enum Diagnostics {
             // 演示走的是真实那条路径：不带 url —— 这一刻本来就没有文件。
             // 以前这里为了让 `show` 收下一个 url 而先写一张演示图进截图目录、
             // 拍完屏再挪进废纸篓，等于自检在用户的保存目录里进出垃圾。
-            preview.show(image: image, selectionRect: rect, screen: screen)
+            preview.show(image: image, selectionRect: rect, screen: screen,
+                         source: ScreenCapture(image: image, screen: screen))
             ToastHUDController.shared.show(title: "就地预览演示",
                                            detail: "「保留」存盘　·　「复制图片」进剪贴板",
                                            thumbnail: image,
@@ -160,7 +161,7 @@ enum Diagnostics {
                 "截图完成后，预览面板直接浮在你刚框选的位置上。",
                 "识别文字后可以按住拖动划选，⌘C 复制；空白处拖动能挪面板。",
                 "The quick brown fox jumps over the lazy dog.",
-                "边框上的圆点手柄可以重新框选，会按新范围重新截一次。"
+                "边框上的圆点手柄可以重新框选，会按新范围从原图上重新裁。"
             ]
             var y = H - 150
             for (index, line) in body.enumerated() {
@@ -730,6 +731,70 @@ enum Diagnostics {
             print("  ✗ 合成图没造出来，翻轴这一节没验到")
         }
 
+        noteGroup("── 整屏原图裁切（预览里改选区只裁原图，不重抓屏）")
+        if let full = quadrantImage(side: 200) {
+            let source = ScreenCapture(image: full,
+                                       screenFrame: CGRect(x: 0, y: 0, width: 100, height: 100),
+                                       scale: 2)
+            let top = source.crop(to: CGRect(x: 0, y: 50, width: 100, height: 50))
+            let bottom = source.crop(to: CGRect(x: 0, y: 0, width: 100, height: 50))
+            let topPixel = top.flatMap(firstPixel)
+            let bottomPixel = bottom.flatMap(firstPixel)
+            let topOK = top?.width == 200 && top?.height == 100 && (topPixel?.0 ?? 0) > 200
+            let bottomOK = bottom?.width == 200 && bottom?.height == 100 && (bottomPixel?.2 ?? 0) > 200
+            if !topOK { failures += 1 }
+            if !bottomOK { failures += 1 }
+            print(String(format: "  %@ 屏幕上半 → %d×%d，R=%d（应为 200×100 红）",
+                         topOK ? "✓" : "✗", top?.width ?? 0, top?.height ?? 0,
+                         topPixel?.0 ?? -1))
+            print(String(format: "  %@ 屏幕下半 → %d×%d，B=%d（应为 200×100 蓝）",
+                         bottomOK ? "✓" : "✗", bottom?.width ?? 0, bottom?.height ?? 0,
+                         bottomPixel?.2 ?? -1))
+
+            let clamped = source.crop(to: CGRect(x: -20, y: -20, width: 50, height: 50))
+            let clampOK = clamped?.width == 60 && clamped?.height == 60
+            if !clampOK { failures += 1 }
+            print("  \(clampOK ? "✓" : "✗") 越界选区夹到图内 → "
+                  + "\(clamped?.width ?? 0)×\(clamped?.height ?? 0)（应为 60×60）")
+
+            let outside = source.crop(to: CGRect(x: 200, y: 200, width: 50, height: 50))
+            let outsideOK = outside == nil
+            if !outsideOK { failures += 1 }
+            print("  \(outsideOK ? "✓" : "✗") 完全在图外的选区 → nil")
+
+            // 副屏：原点不是 0，少减一次屏原点就会裁到另一块内容上
+            let second = ScreenCapture(image: full,
+                                       screenFrame: CGRect(x: 1440, y: 0, width: 100, height: 100),
+                                       scale: 2)
+            let secondTop = second.crop(to: CGRect(x: 1440, y: 50, width: 100, height: 50))
+            let secondOK = secondTop?.width == 200 && secondTop?.height == 100
+                && (secondTop.flatMap(firstPixel)?.0 ?? 0) > 200
+            if !secondOK { failures += 1 }
+            print("  \(secondOK ? "✓" : "✗") 原点 1440 的副屏·上半 → "
+                  + "\(secondTop?.width ?? 0)×\(secondTop?.height ?? 0)（应为 200×100 红）")
+
+            // 横竖倍率不一致：分开算才不会纵向裁错
+            let squashed = ScreenCapture(image: full,
+                                         screenFrame: CGRect(x: 0, y: 0, width: 100, height: 100),
+                                         scaleX: 2, scaleY: 1)
+            let squashedCrop = squashed.crop(to: CGRect(x: 0, y: 0, width: 100, height: 100))
+            let squashedOK = squashedCrop?.width == 200 && squashedCrop?.height == 100
+            if !squashedOK { failures += 1 }
+            print("  \(squashedOK ? "✓" : "✗") 横 2x / 竖 1x → "
+                  + "\(squashedCrop?.width ?? 0)×\(squashedCrop?.height ?? 0)（应为 200×100）")
+
+            let insideOK = InlinePreviewController.canResizeSelection(
+                source: source, selectionRect: CGRect(x: 0, y: 0, width: 100, height: 100))
+            let beyondOK = !InlinePreviewController.canResizeSelection(
+                source: source, selectionRect: CGRect(x: 50, y: 50, width: 100, height: 100))
+            if !insideOK || !beyondOK { failures += 1 }
+            print("  \(insideOK && beyondOK ? "✓" : "✗") 选区在原图内才给手柄"
+                  + "（内=\(insideOK ? "有" : "无")，越界=\(beyondOK ? "无" : "有")）")
+        } else {
+            failures += 1
+            print("  ✗ 合成图没造出来，整屏原图裁切这一节没验到")
+        }
+
         noteGroup("── 窗口位置记忆（左上角锚定 + 拔掉副屏要能退回居中）")
         // 主屏可见区顶上留了菜单栏那 28pt；副屏在右边、原点不是 0。
         let mainVisible = NSRect(x: 0, y: 0, width: 1440, height: 872)
@@ -1222,7 +1287,7 @@ enum Diagnostics {
         if dpiRounding != [144, 72, 108] { failures += 1 }
         print("  \(dpiRounding == [144, 72, 108] ? "✓" : "✗") DPI 换算 2x/1x/1.5x → \(dpiRounding.map(String.init).joined(separator: "/"))")
 
-        noteGroup("── DPI 往返（裁剪、改选区重截都走覆盖写，元数据不能在那一步丢掉）")
+        noteGroup("── DPI 往返（裁剪、改选区重裁都走覆盖写，元数据不能在那一步丢掉）")
         let scratch = FileManager.default.temporaryDirectory
             .appendingPathComponent("Grabi-dpi-\(UUID().uuidString)")
         let shot = scratch.appendingPathComponent("shot.png")
@@ -1239,7 +1304,7 @@ enum Diagnostics {
                     dpiBefore = Int(ImageWriter.dpiWidthForSelfTest(of: shot) ?? 0)
                 }
             }
-            // 覆盖一次，等价于就地预览调整选区后重新截图并保存
+            // 覆盖一次，等价于就地预览调整选区后重新裁切并保存
             if let crop = quadrantImage(side: 32) {
                 try ImageWriter.overwrite(crop, at: shot)
                 dpiAfter = Int(ImageWriter.dpiWidthForSelfTest(of: shot) ?? 0)

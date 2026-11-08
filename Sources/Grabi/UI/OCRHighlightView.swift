@@ -129,6 +129,10 @@ class OCRHighlightView: NSView {
             }
         }
         units = flat
+        // 光标矩形是按每个文字块登记的；识别结果换了一批，旧矩形必须跟着作废。
+        // 不喊这一句，窗口会一直按上一张图的字块显示 I-beam（或反过来，
+        // 新图上的字已经能划选，光标还是手掌）。
+        window?.invalidateCursorRects(for: self)
     }
 
     // MARK: 坐标
@@ -234,10 +238,16 @@ class OCRHighlightView: NSView {
 
     /// 划选文字用 I-beam，空白处（父视图）才是手掌。
     ///
-    /// 这里**必须**给出自己的光标矩形：父视图 `ImagePreviewView` 给整片区域铺了
+    /// 这里**必须给出自己的光标矩形**：父视图 `ImagePreviewView` 给整片区域铺了
     /// `openHand`，没有这一层的话可选择的文字上也显示手掌，分不清哪里能划选。
+    /// 光标矩形只能铺在**文字块**上 —— 以前铺的是整个 bounds，于是空白处虽然
+    /// `hitTest` 会放行给下面拖面板，鼠标却仍显示 I-beam，等于告诉用户
+    /// "这里能选字"，按下去却在拖面板。
     override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .iBeam)
+        for unit in units {
+            guard let box = rect(of: unit, inset: 1.5) else { continue }
+            addCursorRect(box, cursor: .iBeam)
+        }
     }
 
     override func mouseDown(with event: NSEvent) {

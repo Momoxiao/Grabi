@@ -580,6 +580,13 @@ enum UIRenderSelfTest {
         if emitChecks {
             say(String(format: "  两行文案时卡片高 %.0f（单行基线 56）　%@", needed,
                          needed > 62 ? "✓ 会跟着长高" : "✗ 折出来的第二行会被裁掉"))
+            // 可点的角标必须自己说出"能点"。`ToastCardView.init` 里算不出来：
+            // 调用方是 init 之后才挂 onClick 的，初值永远是 nil。这条盯的是
+            // **赋值之后**那句 toolTip 有没有真的补上。
+            let clickable = ToastCardView(title: "已保存", detail: nil, thumbnail: nil)
+            clickable.onClick = {}
+            let tooltipOK = clickable.toolTip == "点击打开这张截图"
+            say("  可点的角标带悬停提示：" + (tooltipOK ? "✓" : "✗（用户只知道它能看，不知道能点）"))
         }
     }
 
@@ -649,6 +656,32 @@ enum UIRenderSelfTest {
             let corner = shell.map { cornerHasDarkBackdrop($0) } ?? false
             say("  角落「×」：" + (corner ? "圆形深底 + 白叉画得出来 ✓"
                                           : "✗ 角落没有深色底，压在浅色内容上会隐身"))
+            // 倍率只该改变图片的大小，投影边距是固定 18pt，不参与缩放。
+            // 把 padded 矩形整体乘 zoom 的话，2× 时图片会比 2 倍大 36pt，
+            // 横纵比例还跟着变 —— 用户看到的是"放大后图被拉糊"。
+            let zoomRect = NSRect(x: 100, y: 100, width: 400, height: 250)
+            let frame2 = InlinePreviewController.previewFrame(for: zoomRect, zoom: 2)
+            let imageW = frame2.width - InlinePreviewController.shadowPadding * 2
+            let imageH = frame2.height - InlinePreviewController.shadowPadding * 2
+            let zoomOK = abs(imageW - 800) < 0.01 && abs(imageH - 500) < 0.01
+                && abs(frame2.midX - zoomRect.midX) < 0.01
+                && abs(frame2.midY - zoomRect.midY) < 0.01
+            say("  2× 预览的图片区域 = \(Int(imageW))×\(Int(imageH))（期望 800×500，投影边距不缩放）"
+                + "　\(zoomOK ? "✓" : "✗")")
+            // 主菜单「视图」的 target=nil 最终要落到 key window（PreviewPanel）上。
+            // 只查 MainMenu 的 selector 拼写不够：PreviewPanel 不实现转发时，
+            // 菜单项会一直是灰的，而 selector 本身永远 compile 得过。
+            let zoomPanel = PreviewPanel(contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+                                         styleMask: [.borderless, .nonactivatingPanel],
+                                         backing: .buffered, defer: false)
+            var forwarded = 0
+            zoomPanel.onZoomIn = { forwarded += 1 }
+            zoomPanel.zoomIn(nil)
+            let zoomMenuWiring = forwarded == 1
+                && zoomPanel.responds(to: #selector(InlinePreviewController.zoomIn(_:)))
+                && zoomPanel.responds(to: #selector(InlinePreviewController.zoomOut(_:)))
+                && zoomPanel.responds(to: #selector(InlinePreviewController.resetZoom(_:)))
+            say("  菜单「放大 / 缩小 / 实际大小」有响应者：" + (zoomMenuWiring ? "✓" : "✗ 菜单项会一直是灰的"))
         }
     }
 
@@ -838,6 +871,19 @@ enum UIRenderSelfTest {
                 }
             say("      \(polluted.isEmpty ? "✓" : "✗") 反向对照：底图里这三档颜色本来一块都没有"
                 + (polluted.isEmpty ? "" : "　读到 \(polluted.joined(separator: "、"))"))
+            // 直线 / 箭头只需要长度，不需要宽高同时非零。水平线、垂直线是最常画的
+            // 两种；以前它们共用矩形那条「宽高都 > 0.5」的门槛，拖出来直接消失。
+            let flatBox = NSRect(x: 0, y: 0, width: 200, height: 100)
+            func axisPath(_ shape: Ink.Shape, _ from: CGPoint, _ to: CGPoint) -> NSBezierPath? {
+                Ink.path(for: Ink.Stroke(tool: .shape(shape), points: [from, to],
+                                         color: .systemRed, width: 0.015), in: flatBox)
+            }
+            let horizontal = axisPath(.line, CGPoint(x: 0.1, y: 0.5), CGPoint(x: 0.9, y: 0.5))
+            let verticalArrow = axisPath(.arrow, CGPoint(x: 0.5, y: 0.1), CGPoint(x: 0.5, y: 0.9))
+            let zeroLength = axisPath(.line, CGPoint(x: 0.5, y: 0.5), CGPoint(x: 0.5, y: 0.5))
+            let axisOK = horizontal != nil && verticalArrow != nil && zeroLength == nil
+            say("      \(axisOK ? "✓" : "✗") 水平直线 / 垂直箭头画得出来，零长度仍然丢掉"
+                + "（读到 水平=\(horizontal != nil)　垂直箭头=\(verticalArrow != nil)　零长=\(zeroLength != nil)）")
         } else {
             say("      ✗ 图上落墨那张没画出来")
         }
@@ -1023,6 +1069,15 @@ enum UIRenderSelfTest {
         printPaneFit(in: content, needed: controller.lastPaneHeight, visible: controller.paneHeightsForSelfTest.visible,
                      document: controller.paneHeightsForSelfTest.document,
                      scroll: controller.paneScrollForSelfTest)
+        if emitChecks {
+            // 清空文件名格式 = 用默认名 Grabi，这是示例行对用户的承诺。走一遍
+            // `namePatternChanged` 的真路径，确认它真的把空串写进偏好（而不是
+            // 因为 `if !trimmed.isEmpty` 静默保留旧模板）。
+            let emptyPattern = controller.persistedNamePatternForSelfTest("")
+            let emptyOK = emptyPattern.isEmpty && SettingsStore.sanitize(emptyPattern) == "Grabi"
+            say("      \(emptyOK ? "✓" : "✗") 清空文件名格式会真的退回默认名 Grabi"
+                + "（偏好读到「\(emptyPattern)」）")
+        }
         // 示例行的竖向余量、⌘ 键切面板，两件检查各自独立跑：谁失败都不该顺手让
         // 另一组数字从输出里消失（早退 = 那一遍没检查，而屏幕上看着一切正常）。
         if let fit = controller.nameExampleFitForSelfTest, emitChecks {

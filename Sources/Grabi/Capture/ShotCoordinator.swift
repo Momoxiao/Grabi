@@ -20,11 +20,25 @@ final class ShotCoordinator {
     private let inlinePreview = InlinePreviewController()
 
     private var isBusy = false
+    /// 失败对话框里的「再试一次」不能在 `presentError` 的模态循环里直接调
+    /// `handleCapture()`：那一刻 `isBusy` 还是 true（外层 Task 要等这里返回才放），
+    /// 重试会被入口闸门当成重复触发静默吞掉。先记下，等流水线收尾再拉起。
+    private var retryAfterBusy = false
 
     /// 就地预览正在展示的那一张。`url` 是**已经落盘**的那份：新的默认流程里
     /// 它从 nil 开始，直到用户在面板上按「保存」（见 `saveOnKeep`）。
     /// `tag` 决定文件名模板里那一段（窗口 / 整屏 / 区域），落盘时才用得上。
-    private var pendingPreviewShot: (url: URL?, image: CGImage, screen: NSScreen?, tag: String)?
+    /// `source` 是截图那一刻的整屏原图：预览里拖边框改选区时从它裁，
+    /// 不再回头抓一次屏。
+    private struct PendingPreviewShot {
+        var url: URL?
+        var image: CGImage
+        var source: ScreenCapture?
+        var screen: NSScreen?
+        var tag: String
+    }
+
+    private var pendingPreviewShot: PendingPreviewShot?
 
     /// 「保存」时顺带写出的 .txt 结果，交给关面板那一句角标说。
     private var keepNote: String?
@@ -127,6 +141,10 @@ final class ShotCoordinator {
             Task {
                 await self.process(outcome)
                 self.isBusy = false
+                if self.retryAfterBusy {
+                    self.retryAfterBusy = false
+                    self.handleCapture()
+                }
             }
         }
     }
@@ -141,32 +159,70 @@ final class ShotCoordinator {
 
     private func process(_ outcome: SelectionOutcome) async {
         guard case .cancelled = outcome else {
-            // 覆盖层刚撤掉，给系统一拍合成时间，否则可能把遮罩拍进去
-            try? await Task.sleep(nanoseconds: 120_000_000)
-            await capture(outcome)
+            // 覆盖层要留到抓图结束；先把它的窗口号取出来，抓图时排除掉，
+            // 这样屏幕上一直有压暗，不会先亮出实时桌面。
+            let exclusions = await MainActor.run { self.overlay.windowIDs }
+            await capture(outcome, excluding: exclusions)
             return
         }
         Log.capture.debug("用户取消了截图")
     }
 
-    private func capture(_ outcome: SelectionOutcome) async {
+    /// 和矩形重叠面积最大的那块屏；窗口跨屏或正好卡在两屏之间时，
+    /// 按"看得见的那部分最多"算，而不是按中心点猜。找不到就退回主屏。
+    private static func screen(covering rect: CGRect) -> NSScreen? {
+        var best: (screen: NSScreen, area: CGFloat)?
+        for screen in NSScreen.screens {
+            let overlap = screen.frame.intersection(rect)
+            guard !overlap.isNull else { continue }
+            let area = overlap.width * overlap.height
+            if best == nil || area > best!.area { best = (screen, area) }
+        }
+        return best?.screen ?? NSScreen.main
+    }
+
+    private func capture(_ outcome: SelectionOutcome, excluding: [CGWindowID]) async {
         do {
             let image: CGImage
+            /// 截图那一刻的整屏原图。区域 / 窗口截图都从它裁出来；
+            /// 预览里拖边框改选区时也只动它，不再抓屏。
+            let source: ScreenCapture?
             let tag: String
-            /// 选区在屏幕上的位置 —— 预览面板要就地盖回这里。
             let selectionRect: CGRect
 
             switch outcome {
-            case .window(let window, let frame):
-                image = try await engine.capture(window: window)
+            case .window(_, let frame):
                 tag = "window"
-                selectionRect = frame
+                // 窗口图也从整屏原图里裁，而不是另抓一张窗口图：
+                // 预览里拖边框改大小时用的就是这张原图，初始图和它必须是同一帧，
+                // 否则一拖手柄就会换成另一张（桌面、遮挡窗口都变了）。
+                guard let screen = Self.screen(covering: frame) else {
+                    throw CaptureError.noDisplay
+                }
+                let visible = frame.intersection(screen.frame)
+                guard !visible.isNull, visible.width >= 1, visible.height >= 1 else {
+                    throw CaptureError.emptySelection
+                }
+                let full = try await engine.captureDisplay(containing: screen,
+                                                           excludingWindowIDs: excluding)
+                let capture = ScreenCapture(image: full, screen: screen)
+                guard let cropped = capture.crop(to: visible) else {
+                    throw CaptureError.cropFailed
+                }
+                image = cropped
+                source = capture
+                selectionRect = visible
             case .display(let target):
-                image = try await engine.captureDisplay(containing: target)
+                image = try await engine.captureDisplay(containing: target,
+                                                        excludingWindowIDs: excluding)
+                source = ScreenCapture(image: image, screen: target)
                 tag = "display"
                 selectionRect = target.frame
             case .region(let rect, let target):
-                image = try await engine.captureRegion(rect, on: target)
+                let capture = try await engine.captureRegion(rect, on: target,
+                                                             excludingWindowIDs: excluding)
+                image = capture.image
+                source = capture.source
                 tag = "region"
                 selectionRect = rect
             case .cancelled:
@@ -184,16 +240,26 @@ final class ShotCoordinator {
             }
             try? await Task.sleep(nanoseconds: UInt64(Self.previewDelayAfterFeedback * 1_000_000_000))
             await MainActor.run {
-                let screen = InlinePreviewController.screenUnderMouse()
-                self.pendingPreviewShot = (nil, image, screen, tag)
+                let screen = Self.screen(covering: selectionRect)
+                    ?? InlinePreviewController.screenUnderMouse()
+                self.pendingPreviewShot = PendingPreviewShot(url: nil, image: image,
+                                                             source: source,
+                                                             screen: screen, tag: tag)
+                // 预览和压暗先铺在覆盖层下面，再把覆盖层撤掉：两个状态在同一次
+                // runloop 提交，中间不会露出实时桌面。
                 self.inlinePreview.show(image: image,
                                         selectionRect: selectionRect,
-                                        screen: screen)
+                                        screen: screen,
+                                        source: source)
+                self.overlay.dismiss()
+                self.inlinePreview.focus()
             }
         } catch let error as CaptureError {
+            await MainActor.run { self.overlay.dismiss() }
             if case .emptySelection = error { return }   // 用户主动放弃，不打扰
             await MainActor.run { self.presentError(error) }
         } catch {
+            await MainActor.run { self.overlay.dismiss() }
             await MainActor.run { self.presentError(error) }
         }
     }
@@ -216,11 +282,22 @@ final class ShotCoordinator {
     /// 所以 tag 跟着 `pendingPreviewShot` 一起存着，而不是在这儿猜。
     private func saveOnKeep(image: CGImage, sourceRect: CGRect, ocrText: String?) -> URL? {
         let tag = pendingPreviewShot?.tag ?? "region"
+        // 倍率必须取**抓图那一刻**那块屏的，而不是预览当前所在位置：
+        // 用户把预览拖到另一块缩放比不同的屏再按保存时，`sourceRect` 已经是新屏的
+        // 坐标，按它推断会把 1x 屏截的图写成 144dpi（插进文档凭空大一倍）。
+        let captureScale = pendingPreviewShot?.source?.scale
+            ?? pendingPreviewShot?.screen?.backingScaleFactor
         do {
-            let url = try ImageWriter.write(image, type: tag, sourceRect: sourceRect)
+            let url = try ImageWriter.write(image, type: tag, sourceRect: sourceRect,
+                                            scale: captureScale)
             settings.rememberShot(url.path)
-            // 面板可能在保存前重新框选过；同步最终图，关闭时角标才不会拿旧缩略图。
-            pendingPreviewShot = (url, image, pendingPreviewShot?.screen, tag)
+            // 面板可能在保存前拖过手柄；同步最终图，关闭时角标才不会拿旧缩略图。
+            // `source` 保持原样：整屏原图不随裁剪结果变。
+            if var shot = pendingPreviewShot {
+                shot.url = url
+                shot.image = image
+                pendingPreviewShot = shot
+            }
             keepNote = Self.writeSidecarIfNeeded(ocrText: ocrText, alongside: url)
             return url
         } catch {
@@ -258,7 +335,11 @@ final class ShotCoordinator {
         // 不再断言"有没有进剪贴板"：截图本身不进，用户按没按「复制图片」是
         // 他自己刚做过、也刚看过回执的事，这里再念一遍只会是第二份真相。
         var detail = "\(prefix)　·　存到 \(directory)"
-        detail += note.map { "　·\($0)" } ?? ""
+        // `ocrTextStatus` / `ocrTextPendingStatus` 自带「　·　」前缀；再补一个
+        // 分隔符会变成「 · · 已存」，角标上看着像排版坏了。没有前缀的才补。
+        if let note {
+            detail += note.hasPrefix("　") ? note : "　·\(note)"
+        }
 
         ToastHUDController.shared.show(title: url.lastPathComponent,
                                        detail: detail,
@@ -329,7 +410,9 @@ final class ShotCoordinator {
         switch failure?.recovery {
         case .openPermissionSettings: Permissions.openScreenRecordingSettings()
         case .openSettings:           onOpenSettings?()
-        case .retry:                  handleCapture()
+        case .retry:
+            // 见 `retryAfterBusy`：模态框里直接重入会被 isBusy 闸门吞掉。
+            if isBusy { retryAfterBusy = true } else { handleCapture() }
         case .none:                   break
         }
     }

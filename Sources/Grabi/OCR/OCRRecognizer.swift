@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import CoreText
 import Vision
 import AppKit
 
@@ -154,15 +155,14 @@ final class OCRRecognizer {
         // 与旧 API 同样的硬约束：两个语言开关必须由同一个条件推导。
         // 「不设 recognitionLanguages + automaticallyDetectsLanguage = false」
         // 会让 Vision 不知道该用哪套模型，卡住后报错。
-        let detectsLanguage = languages.isEmpty
-        if !detectsLanguage {
-            // 只保留系统真的支持的语言（`Locale.Language` 可比较，直接用集合判断）
-            let supported = Set(request.supportedRecognitionLanguages)
-            request.recognitionLanguages = languages
-                .map { Locale.Language(identifier: $0) }
-                .filter { supported.contains($0) }
-        }
-        request.automaticallyDetectsLanguage = detectsLanguage
+        // 注意要按**过滤之后**的结果判断：用户选的语言可能被新版引擎全部过滤掉，
+        // 那时若还按"传进来了几个"设 false，就会正好落进上面那个坏组合。
+        let supported = Set(request.supportedRecognitionLanguages)
+        let resolved = languages
+            .map { Locale.Language(identifier: $0) }
+            .filter { supported.contains($0) }
+        request.recognitionLanguages = resolved
+        request.automaticallyDetectsLanguage = resolved.isEmpty
 
         if tuning.minimumTextHeight > 0 {
             request.minimumTextHeightFraction = tuning.minimumTextHeight
@@ -467,24 +467,35 @@ final class OCRRecognizer {
 
     /// 预热用的小图。**必须画真的字**——只画色块的话文字检测阶段找不到任何
     /// 文本区域，识别模型可能压根不加载，预热就白做了。
+    ///
+    /// 这里刻意不用 `NSBitmapImageRep` / `NSGraphicsContext` / `NSString.draw`：
+    /// 预热跑在 `visionQueue` 后台线程上，而 AppKit 的绘图不是线程安全的。
+    /// 那种错法很安静——图可能画成空白（预热"成功"但没加载模型，用户第一次
+    /// 识别仍要等几十秒），也可能在别的系统版本上直接崩。CoreGraphics + CoreText
+    /// 本来就是线程安全的，画出来的东西也和这里要的一模一样。
     private static func makeWarmUpImage() -> CGImage? {
         let width = 120, height = 44
-        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
-                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
-                                         isPlanar: false, colorSpaceName: .deviceRGB,
-                                         bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
-        NSGraphicsContext.saveGraphicsState()
-        if let context = NSGraphicsContext(bitmapImageRep: rep) {
-            NSGraphicsContext.current = context
-            NSColor.white.setFill()
-            NSRect(x: 0, y: 0, width: width, height: height).fill()
-            ("Grabi 8" as NSString).draw(in: NSRect(x: 4, y: 10, width: width - 8, height: 24),
-                                            withAttributes: [.font: NSFont.systemFont(ofSize: 20),
-                                                             .foregroundColor: NSColor.black])
-            context.flushGraphics()
-        }
-        NSGraphicsContext.restoreGraphicsState()
-        return rep.cgImage
+        guard let context = CGContext(data: nil, width: width, height: height,
+                                      bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)
+                                          ?? CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+
+        context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+        let font = CTFontCreateWithName("Helvetica" as CFString, 20, nil)
+        let attributes: [CFString: Any] = [
+            kCTFontAttributeName: font,
+            kCTForegroundColorAttributeName: CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        ]
+        guard let text = CFAttributedStringCreate(nil, "Grabi 8" as CFString,
+                                                  attributes as CFDictionary) else { return nil }
+        let line = CTLineCreateWithAttributedString(text)
+        context.textPosition = CGPoint(x: 4, y: 10)
+        CTLineDraw(line, context)
+        return context.makeImage()
     }
 
     // MARK: - 结果装配
@@ -497,14 +508,36 @@ final class OCRRecognizer {
         let units: [Unit]
     }
 
+    /// 把「规范化文本」里的 range 映射回 Vision 原始候选文本里的 range。
+    ///
+    /// `normalizePunctuation` 只保证**字符数**不变（全角括号 → 半角），UTF-8
+    /// 字节长度会变。`String.Index` 绑定它来源的那个字符串，直接把 normalized
+    /// text 的 index 交给 `candidate.boundingBox(for:)`，Vision 会按错误的位置
+    /// 取字（实测偏一整个字符），字级高亮框随之错位。所以这里按 Character
+    /// offset 重建区间。
+    private static func sourceRange(_ range: Range<String.Index>,
+                                    in text: String,
+                                    original: String) -> Range<String.Index>? {
+        let lower = text.distance(from: text.startIndex, to: range.lowerBound)
+        let upper = text.distance(from: text.startIndex, to: range.upperBound)
+        guard let start = original.index(original.startIndex, offsetBy: lower,
+                                         limitedBy: original.endIndex),
+              let end = original.index(start, offsetBy: upper - lower,
+                                       limitedBy: original.endIndex) else { return nil }
+        return start..<end
+    }
+
     /// 旧引擎的观测 → 片段。
     private static func assembleLegacy(_ observations: [VNRecognizedTextObservation]) -> [Line] {
         let fragments: [Fragment] = observations.compactMap { observation -> Fragment? in
             guard let candidate = observation.topCandidates(1).first else { return nil }
-            let text = Self.normalizePunctuation(candidate.string)
+            let original = candidate.string
+            let text = Self.normalizePunctuation(original)
             // 旧 API 的 `boundingBox(for:)` 是 throwing 的，取不到就跳过
             let boxProvider: (Range<String.Index>) -> CGRect? = { range in
-                try? candidate.boundingBox(for: range)?.boundingBox
+                guard let source = Self.sourceRange(range, in: text, original: original)
+                else { return nil }
+                return try? candidate.boundingBox(for: source)?.boundingBox
             }
             let units = splitUnits(of: text, box: boxProvider)
             return Fragment(text: text,
@@ -519,11 +552,14 @@ final class OCRRecognizer {
     private static func assembleModern(_ observations: [RecognizedTextObservation]) -> [Line] {
         let fragments: [Fragment] = observations.compactMap { observation -> Fragment? in
             guard let candidate = observation.topCandidates(1).first else { return nil }
-            let text = Self.normalizePunctuation(candidate.string)
+            let original = candidate.string
+            let text = Self.normalizePunctuation(original)
             // 新 API 的同名方法是可选返回，不抛错
             // 新 API 的 `boundingBox` 是 NormalizedRect，取 `cgRect` 才是 CGRect
             let boxProvider: (Range<String.Index>) -> CGRect? = { range in
-                candidate.boundingBox(for: range)?.boundingBox.cgRect
+                guard let source = Self.sourceRange(range, in: text, original: original)
+                else { return nil }
+                return candidate.boundingBox(for: source)?.boundingBox.cgRect
             }
             let units = splitUnits(of: text, box: boxProvider)
             let box = observation.boundingBox.cgRect

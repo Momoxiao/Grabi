@@ -256,6 +256,12 @@ final class HotKeyCenter {
     @discardableResult
     func register(_ spec: HotKeySpec, handler: @escaping Handler) -> Bool {
         guard !spec.isDisabled else { return false }
+        // 事件处理器没装上时，下面 RegisterEventHotKey 仍可能返回 noErr，
+        // 但回调永远不会来 —— 那种"注册成功、按键没反应"必须当成失败报给用户。
+        guard eventHandler != nil else {
+            Log.hotkey.error("热键事件处理器未安装，跳过 \(spec.displayString, privacy: .public) 的注册")
+            return false
+        }
 
         let id = nextID
         nextID += 1

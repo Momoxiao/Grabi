@@ -3,9 +3,9 @@ import CoreGraphics
 
 /// 调整选区时的全屏覆盖层：**和「区域截图」一模一样**。
 ///
-/// 整屏压暗 + 选区挖空，挖空处露出真实画面，边缘八个手柄。
-/// 拖动时看到的是"重新框一块区域"，而不是把已截好的图拉伸变形——
-/// 后者在放大时会给出严重失真的预览，误导用户。
+/// 整屏压暗 + 选区挖空，挖空处露出**截图那一刻的整屏原图**，边缘八个手柄。
+/// 拖动时看到的是"在同一张原图上重新框一块"，既不是拉伸已截好的图，
+/// 也不是实时屏幕——后者会让改大改小后的画面和原图不是同一帧。
 ///
 /// 选区被限制在**一块屏幕**内（和区域截图一致），不做跨屏拼接。
 final class SelectionAdjustOverlay {
@@ -14,6 +14,9 @@ final class SelectionAdjustOverlay {
     private var masks: [DimOverlayView] = []
     private var handlesView: ResizeHandlesView?
     private weak var targetScreen: NSScreen?
+    /// 原图的像素倍率，只用于选区角标那句「宽 × 高」和裁切保持一致。
+    private var sourceScaleX: CGFloat?
+    private var sourceScaleY: CGFloat?
 
     private var currentRect: CGRect = .zero
 
@@ -21,13 +24,8 @@ final class SelectionAdjustOverlay {
     /// 外部只管"拿到结果之后怎么办"。
     var onFinish: ((CGRect?) -> Void)?
 
-    /// 刚撤掉的那几块覆盖层的窗口号。
-    ///
-    /// 关掉之后系统合成还可能残留一两帧，把它们一并交给
-    /// `SCContentFilter` 排除掉，重新抓的图才干净。
-    private(set) var dismissedWindowIDs: [CGWindowID] = []
-
     /// 开始调整。`rect` 是当前选区（屏幕坐标，原点左下）。
+    /// `source` 是整屏原图；nil 时挖空处会露出实时屏幕（旧观感兜底）。
     ///
     /// ⚠️ 覆盖层的窗口一律 `ignoresMouseEvents = true`——它只负责"看"，
     /// 不负责"接"。鼠标事件全程留在**预览面板**的手柄上，由外部用
@@ -39,20 +37,25 @@ final class SelectionAdjustOverlay {
     /// 让覆盖层穿透之后，整趟拖动只有一个窗口参与，问题从根上消失。
     /// （窗口仍然 `makeKey`，Esc 取消照常可用——`ignoresMouseEvents`
     ///   只挡鼠标，不挡键盘。）
-    func begin(screen: NSScreen, rect: CGRect) {
+    func begin(screen: NSScreen, rect: CGRect, source: ScreenCapture?) {
         dismissWindows()
-        dismissedWindowIDs = []      // 上一轮的残留 ID 别带进来
 
         self.targetScreen = screen
         self.currentRect = rect
+        self.sourceScaleX = source?.scaleX
+        self.sourceScaleY = source?.scaleY
 
         for target in NSScreen.screens {
+            // 用调用方传进来的屏幕对象认目标，而不是用 rect 中心点猜：
+            // 多屏时中心点可能落在两屏之间的空档，猜出来会铺错屏幕。
+            let isTarget = target === screen
             let window = AdjustWindow(contentRect: target.frame,
                                       styleMask: .borderless,
                                       backing: .buffered,
                                       defer: false,
                                       screen: target)
             window.setFrame(target.frame, display: false)
+            window.animationBehavior = .none
             window.level = ShotLevels.overlay    // 必须在预览面板之上
             window.isOpaque = false
             window.backgroundColor = .clear
@@ -60,9 +63,10 @@ final class SelectionAdjustOverlay {
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
             window.ignoresMouseEvents = true      // 纯视觉，鼠标穿透到下面的预览面板
             window.acceptsMouseMovedEvents = true
-            window.onCancel = { [weak self] in self?.commit() }
+            window.onCancel = { [weak self] in self?.abort() }
 
             let mask = DimOverlayView(frame: NSRect(origin: .zero, size: target.frame.size))
+            if isTarget { mask.sourceImage = source?.image }
             window.contentView = mask
             window.orderFrontRegardless()
 
@@ -70,7 +74,7 @@ final class SelectionAdjustOverlay {
             masks.append(mask)
 
             // 手柄只挂在选区所在的那块屏上，纯绘制用
-            if target.frame.contains(NSPoint(x: rect.midX, y: rect.midY)) {
+            if isTarget {
                 let handles = ResizeHandlesView(frame: .zero)
                 handles.isInteractionEnabled = false      // 不接管，只画
                 mask.addSubview(handles)
@@ -111,13 +115,26 @@ final class SelectionAdjustOverlay {
         layout(clamp(rect))
     }
 
-    /// 松手（Esc 取消也是走这里）：拆掉覆盖层，通知外部收尾。
+    /// 松手：把当前选区交给外部裁切，**再**拆覆盖层。
+    ///
+    /// 顺序不能反：外部会趁覆盖层还在的时候把新预览和新压暗层铺到它下面，
+    /// 等覆盖层一撤，用户直接看到新图。先拆的话，覆盖层和预览之间会露出一帧
+    /// 实时桌面——就是「松手闪一下」。
     func commit() {
         let result = currentRect
-        dismissWindows()
         let callback = onFinish
         onFinish = nil
         callback?(result)
+        dismissWindows()
+    }
+
+    /// Esc / ⌘W：这次调整作废，回到原选区（不提交半途的尺寸）。
+    /// 传 nil 给外部 = "白拖一次"，外部按原 `currentRect` 把预览铺回去。
+    func abort() {
+        let callback = onFinish
+        onFinish = nil
+        callback?(nil)
+        dismissWindows()
     }
 
     /// 强行拆掉，不通知任何人（预览面板被关掉时用）。
@@ -158,7 +175,9 @@ final class SelectionAdjustOverlay {
                                height: rect.height)
             let visible = local.intersection(mask.bounds)
             mask.holeRect = visible.isNull ? nil : visible
-            mask.badgeText = Self.badge(for: rect)
+            mask.badgeText = Self.badge(for: rect,
+                                        scaleX: sourceScaleX,
+                                        scaleY: sourceScaleY)
         }
 
         handlesView?.frame = CGRect(x: rect.minX - (targetScreen?.frame.minX ?? 0),
@@ -168,15 +187,19 @@ final class SelectionAdjustOverlay {
         handlesView?.needsDisplay = true
     }
 
-    private static func badge(for rect: CGRect) -> String {
-        // 倍率跟写盘同源（见 ScreenGeometry）：角标说的像素尺寸，要和文件里
-        // 实际落的 DPI 是同一块屏算出来的，不然「显示 2880×1620，插进文档却是 2 倍大」。
-        let scale = ScreenGeometry.scale(of: rect)
-        return "\(Int((rect.width * scale).rounded())) × \(Int((rect.height * scale).rounded()))"
+    private static func badge(for rect: CGRect,
+                              scaleX: CGFloat?,
+                              scaleY: CGFloat?) -> String {
+        // 倍率跟写盘同源：有原图时直接用抓图那一刻的像素倍率，
+        // 和文件里实际落的 DPI 是同一个数，不然「显示 2880×1620，插进文档却是 2 倍大」。
+        // 没有原图才退回按当前屏幕算。
+        let fallback = ScreenGeometry.scale(of: rect)
+        let x = scaleX ?? fallback
+        let y = scaleY ?? fallback
+        return "\(Int((rect.width * x).rounded())) × \(Int((rect.height * y).rounded()))"
     }
 
     private func dismissWindows() {
-        dismissedWindowIDs = windows.map { CGWindowID($0.windowNumber) }
         for window in windows {
             window.alphaValue = 0
             window.orderOut(nil)
@@ -276,25 +299,25 @@ final class InlinePreviewController: NSObject {
     private var toolbarPanel: NSPanel?
     private var previewView: ImagePreviewView?
     private var handlesView: ResizeHandlesView?
+    /// 右上角那颗「×」。钉住那一刻如果鼠标已经在图上，它必须当场出现，
+    /// 不能等用户把鼠标移出去再移回来（见 `pinIfNeeded`）。
+    private var closeButton: NSButton?
+    /// 鼠标此刻是否在预览图上。`onHoverChanged` 只在进出时回调，
+    /// 拖动过程中指针一直没离开，钉住时得问这个状态才知道「×」该不该出来。
+    private var isHoveringPreview = false
 
     /// 当前显示的图。OCR 用的也是它。
     private var image: CGImage?
+    /// 截图那一刻的整屏原图。拖边框改选区时只从它重新裁一块——
+    /// 不再回头抓屏，所以画面永远停在按下快门的那一帧。
+    private var source: ScreenCapture?
     /// 已经落盘的那一份。nil = 这张图目前只在剪贴板里，按「保留」才会有文件。
     private var url: URL?
 
     /// 预览面板（也就是选区）当前占据的屏幕矩形。拖手柄改的就是它，
-    /// 松手后按它重新截一次——**不是**从已截好的图里裁一块，
-    /// 那样放大时补不出原本没有的像素。
+    /// 松手后按它在**整屏原图**上重新裁一块。
     private var currentRect: CGRect = .zero
     private var currentScreen: NSScreen?
-
-    /// 重新截取进行中。避免连着松手触发多次抓屏。
-    private var isRecapturing = false
-    /// 在途的重新抓屏任务。新一轮调整开始或面板关闭时必须取消——
-    /// 否则它完成时会按**旧选区**把预览和压暗层铺回来，正好撞上
-    /// 用户正在进行的下一次拖动（表现：旧截图带着手柄突然浮现，
-    /// 盖在覆盖层挖空处里）；面板若已关闭，还会漏铺一块永远不走的压暗层。
-    private var recaptureTask: Task<Void, Never>?
 
     /// 工具栏形态。切换时带动画，别让按钮"跳变"。
     ///
@@ -326,6 +349,13 @@ final class InlinePreviewController: NSObject {
     private var ocrLines: [OCRRecognizer.Line] = []
     private let recognizer = OCRRecognizer()
     private var isRecognizing = false
+
+    /// 识别任务的代际。每次换图（show / dismiss / 改选区重裁）都递增：
+    /// Vision 没法真正取消，旧任务回来时必须靠这个数认出"我已经不代表当前这张图"，
+    /// 否则截图 A 的结果会装到截图 B 的预览和高亮层上。
+    private var ocrGeneration = 0
+    /// 在途的识别任务。换图 / 关面板时取消，并且和 `ocrGeneration` 双重把关。
+    private var ocrTask: Task<Void, Never>?
 
     /// 面板一浮出就**抢跑**的那一趟识别。
     ///
@@ -383,7 +413,18 @@ final class InlinePreviewController: NSObject {
     /// 边框手柄只服务“还没拖走的原始预览”。固定态只允许滚轮缩放。
     static func allowsSelectionResize(isPinned: Bool) -> Bool { !isPinned }
 
+    /// 有原图、且选区整块落在原图覆盖的屏幕内，才谈得上"在原图上改尺寸"。
+    /// 窗口跨屏被裁到一块屏内之后正常；真遇到覆盖不全的情况宁可不给手柄，
+    /// 也不让用户拖着拖着换到另一张图上。
+    static func canResizeSelection(source: ScreenCapture?, selectionRect: CGRect) -> Bool {
+        guard let source else { return false }
+        return source.screenFrame.contains(selectionRect)
+    }
+
     var isVisible: Bool { previewPanel != nil }
+
+    /// 覆盖层撤掉后把键盘焦点交回预览（Esc / 回车 / ⌘C 才有主）。
+    func focus() { previewPanel?.makeKey() }
 
     // MARK: - 显示
 
@@ -395,22 +436,39 @@ final class InlinePreviewController: NSObject {
     /// - Parameters:
     ///   - selectionRect: 选区在屏幕坐标系（原点主屏左下）中的矩形。
     ///   - screen: 选区所在屏幕，用于铺压暗层和摆放工具栏。
+    ///   - source: 截图那一刻的整屏原图；拖手柄改选区时从它重新裁。
+    ///     nil = 没有可裁的原图（理论上不该发生），手柄会停用。
     func show(image: CGImage,
               selectionRect: CGRect,
-              screen: NSScreen?) {
+              screen: NSScreen?,
+              source: ScreenCapture?) {
         dismissIfVisible()
 
         self.image = image
+        self.source = source
         self.url = nil
         self.isOCRMode = false
         self.previewZoom = 1
         self.zoomHintShown = false
-        self.isRecapturing = false
         self.ocrLines = []
         self.didMovePreview = false
         self.isPinned = false
-        self.setResizeHandlesEnabled(true)
+        self.isHoveringPreview = false
+        self.closeButton = nil
+        self.setResizeHandlesEnabled(Self.canResizeSelection(source: source,
+                                                             selectionRect: selectionRect))
+        self.prefetchTask?.cancel()
         self.prefetchTask = nil
+        // 上一张图的 OCR 可能还在跑（Vision 不响应取消），换图时必须换代：
+        // 旧任务回来时不能把上一张的字装到这一张上，也不能让新图的
+        // 「识别文字」被旧的 `isRecognizing` 一直挡着。
+        self.ocrGeneration += 1
+        self.ocrTask?.cancel()
+        self.ocrTask = nil
+        self.isRecognizing = false
+        self.failureResetTimer?.invalidate()
+        self.failureResetTimer = nil
+        self.failureText = nil
         // 每一张新截图从干净开始：上一张的圈画指的是上一张的像素，
         // 跟着挪过来只会变成盖在新内容上的旧痕迹。
         self.inkTool = nil
@@ -423,11 +481,10 @@ final class InlinePreviewController: NSObject {
         buildPreviewPanel(for: selectionRect)
         buildToolbarPanel()
 
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = Motion.duration(0.14)
-            previewPanel?.animator().alphaValue = 1
-            toolbarPanel?.animator().alphaValue = 1
-        }
+        // 直接到最终状态，不做淡入：压暗层的挖空是透明的，预览 alpha 从 0
+        // 一点点升上来的这 0.14 秒里，挖空里露的是实时屏幕——就是"闪一下"。
+        previewPanel?.alphaValue = 1
+        toolbarPanel?.alphaValue = 1
 
         // 键盘通路：截图时 overlay 已经把本 app 激活了，这里让预览面板接管 key，
         // Esc / 回车 / ⌘C 才能被它接住（否则面板永远收不到键盘事件）。
@@ -442,6 +499,12 @@ final class InlinePreviewController: NSObject {
             self.keep()
         }
         previewPanel?.onCopy = { [weak self] in self?.copyCurrent() }
+        // 主菜单「视图」里的三条 zoom 动作 target 留 nil，靠响应链找到 key window。
+        // `InlinePreviewController` 是普通 NSObject，不在响应链里；必须由 `PreviewPanel`
+        // 转发回来，否则这三条菜单项永远是灰的（快捷键 ⌘= / ⌘- / ⌘1 也一起失效）。
+        previewPanel?.onZoomIn = { [weak self] in self?.zoomIn(nil) }
+        previewPanel?.onZoomOut = { [weak self] in self?.zoomOut(nil) }
+        previewPanel?.onZoomReset = { [weak self] in self?.resetZoom(nil) }
         previewPanel?.onInkAction = { [weak self] action in
             switch action {
             case .undo: self?.undoInk()
@@ -449,7 +512,8 @@ final class InlinePreviewController: NSObject {
             case .shape: self?.setInkTool(.shape(self?.lastShape ?? .rectangle))
             }
         }
-        setResizeHandlesEnabled(true)
+        setResizeHandlesEnabled(Self.canResizeSelection(source: source,
+                                                         selectionRect: selectionRect))
         previewPanel?.makeKey()
         // 画完一笔要立刻重画工具栏：那颗「撤销」从灰变亮，是唯一说明
         // "这一笔收下了"的反馈（图上已经画了，但按钮不动的话人不敢信）。
@@ -490,13 +554,12 @@ final class InlinePreviewController: NSObject {
         // 两条路都走工具栏那颗按钮同一个函数，不是"再复制一遍"的第二份写法：
         // 分开写的话，一条回读了剪贴板、一条没回读，⌘C 就成了那个不说谎也没说真话的。
         guard isOCRMode else { return copyImageToClipboard() }
-        // OCR 模式下只认"已经划选了什么" —— 没划选时给一条明确提示，
-        // 不再自动改成复制全文。否则用户分不清自己按的是"复制这一段"还是"复制全部"。
-        if hasSelectedText { copySelectedText() } else {
-            ToastHUDController.shared.show(title: "先在图上划一段文字",
-                                           detail: "要整页文字请按「复制全文」",
-                                           screen: currentScreen,
-                                           duration: 3.6)
+        // 键盘 ⌘C 保留"没划选就直接复制全部"的顺手路径（文档和工具栏 tooltip
+        // 都是这么承诺的）；工具栏那颗「复制选中」才严格照划选走、没划选时提示。
+        if hasSelectedText {
+            copySelectedText()
+        } else {
+            copyAllText()
         }
     }
 
@@ -652,6 +715,7 @@ final class InlinePreviewController: NSObject {
                                      backing: .buffered,
                                      defer: false)
             panel.isFloatingPanel = true
+            panel.animationBehavior = .none
             panel.level = ShotLevels.dim
             panel.isOpaque = false
             panel.backgroundColor = .clear
@@ -689,6 +753,7 @@ final class InlinePreviewController: NSObject {
                                  backing: .buffered,
                                  defer: false)
         panel.isFloatingPanel = true
+        panel.animationBehavior = .none
         panel.level = ShotLevels.preview
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -748,11 +813,13 @@ final class InlinePreviewController: NSObject {
         view.contextMenuProvider = { [weak self] in self?.makeContextMenu() }
         // 鼠标进到图上 → 角落浮出「×」；移开 → 收起来。
         let closeButton = makePreviewCloseButton()
+        self.closeButton = closeButton
         // 起手是藏着的，而且**不只是"鼠标没在上面"**：刚截完那一档压根不该有「×」，
         // 见 `setCloseButton` 的说明。`mouseEntered` 只负责"钉住之后"那一次的显隐。
         closeButton.alphaValue = 0
         closeButton.isHidden = true
         container.onHoverChanged = { [weak self, weak closeButton] hovering in
+            self?.isHoveringPreview = hovering
             guard let closeButton else { return }
             self?.setCloseButton(closeButton, visible: hovering)
         }
@@ -786,7 +853,7 @@ final class InlinePreviewController: NSObject {
         container.layoutSubtreeIfNeeded()
         container.updateAmbientShadowPath(imageFrame: view.frame)
 
-        // 可调节边框：刚截完时显示八个手柄，拖动它们会重新框选并重截。
+        // 可调节边框：刚截完时显示八个手柄，拖动它们会在整屏原图上重新框选（不重新截屏）。
         // 一旦预览被拖走进入固定态，这一层会整体停用；之后只能滚轮缩放。
         let handles = ResizeHandlesView(frame: view.bounds)
         handles.translatesAutoresizingMaskIntoConstraints = false
@@ -909,14 +976,17 @@ final class InlinePreviewController: NSObject {
         isPinned = true
         setResizeHandlesEnabled(false)
         // 提到"钉住的预览"那一层：拖走之后这张要盖过别的 app 的普通窗口，
-        // 不能被谁顶到后面去。仍然在全屏覆盖层（截图选区）之下 —— 抓图那一刻
-        // 它本来就会被排除在抓屏之外并暂时藏起来。
+        // 不能被谁顶到后面去。仍然在全屏覆盖层（截图选区）之下 —— 下一次截图
+        // 开始时会先把这张收掉。
         previewPanel?.level = ShotLevels.pinnedPreview
         fadeOutDimPanel()
         // 从"刚截完的浮条"切成"贴在屏幕上的一张图"：工具栏会挡住要看的内容，
         // 而这一刻起操作入口是图上右键和角落那颗「×」。
         toolbarPanel?.alphaValue = 0
         toolbarPanel?.ignoresMouseEvents = true
+        // 拖动进入钉住态时鼠标通常还在图上，`onHoverChanged` 不会重新触发；
+        // 这里按当前 hover 状态立刻把「×」补出来，否则用户得先移出去再移回来。
+        if let closeButton { setCloseButton(closeButton, visible: isHoveringPreview) }
         ToastHUDController.shared.show(title: "已固定在屏幕上",
                                        detail: "滚轮调整大小　·　右上角「×」关闭　·　点别处不会收走",
                                        screen: currentScreen,
@@ -945,26 +1015,29 @@ final class InlinePreviewController: NSObject {
 
     /// 按下手柄的瞬间切到"选取"模式：藏起预览，铺一层整屏压暗 + 挖空的覆盖层。
     ///
-    /// 刻意**不**去拉伸已经截好的图——放大时拉伸出来的画面是失真的，
-    /// 用户会以为那就是调整后的结果。挖空处露出的是真实屏幕画面，所见即所得。
+    /// 挖空处露出的是**整屏原图**，不是实时屏幕：改大改小都只在原图上换裁剪矩形，
+    /// 不会重新抓屏。底下的窗口、网页在这之后变了也影响不到这张图。
     ///
     /// 覆盖层的窗口 `ignoresMouseEvents = true`：鼠标全程留在预览面板的手柄上，
     /// 松手通过 `finishAdjustingSelection()` 收尾。整趟拖动只涉及一个窗口，
     /// 不会出现"光标变了但拖不动"的接力失败。
     private func beginAdjustingSelection() {
         guard let screen = currentScreen else { return }
+        guard let source,
+              Self.canResizeSelection(source: source, selectionRect: currentRect)
+        else { return }
         guard Self.allowsSelectionResize(isPinned: isPinned) else { return }
 
-        // 上一轮的重新抓屏还没回来就又开始拖：把它取消掉。不然它完成时会
-        // 把预览（旧图）和压暗层按旧选区铺回来，盖在覆盖层挖空露出的画面上。
-        recaptureTask?.cancel()
-        recaptureTask = nil
-        isRecapturing = false
+        // 先把覆盖层（原图 + 压暗）铺上来，再撤旧预览。反过来的话，
+        // 旧压暗撤掉和覆盖层出现之间会漏一帧实时桌面——按下手柄那一下也会闪。
+        adjustOverlay.onFinish = { [weak self] rect in
+            self?.finishAdjustingSelection(finalRect: rect)
+        }
+        adjustOverlay.begin(screen: screen, rect: currentRect, source: source)
 
         // 压暗层必须**立刻**撤掉（不能淡出，拖动时它还在就来不及了）：
         // ① 覆盖层自带压暗，两层叠一起会让选区挖空处也是黑的；
-        // ② 它的挖空还是旧选区，会盖在新选区上；
-        // ③ 更要紧的是——它会被下面的重新抓屏拍进去。
+        // ② 它的挖空还是旧选区，会盖在新选区上。
         hideDimPanel()
 
         // 覆盖层在 `ShotLevels.overlay`，会盖住预览；但预览仍会漏出影子，先藏掉。
@@ -976,11 +1049,6 @@ final class InlinePreviewController: NSObject {
             toolbarPanel?.alphaValue = 0
             toolbarPanel?.ignoresMouseEvents = true
         }
-
-        adjustOverlay.onFinish = { [weak self] rect in
-            self?.finishAdjustingSelection(finalRect: rect)
-        }
-        adjustOverlay.begin(screen: screen, rect: currentRect)
     }
 
     /// 拖动中：把增量交给覆盖层。
@@ -989,7 +1057,7 @@ final class InlinePreviewController: NSObject {
         adjustOverlay.apply(handle: handle, delta: delta)
     }
 
-    /// 松手（Esc 也是这里）：按新选区重新抓屏。
+    /// 松手（Esc 也是这里）：按新选区从**整屏原图**上重新裁一块。
     /// `finalRect` 是覆盖层给出的最终选区；nil 或与原选区相同都算"白拖一次"。
     private func finishAdjustingSelection(finalRect: CGRect?) {
         toolbarPanel?.ignoresMouseEvents = false
@@ -997,34 +1065,45 @@ final class InlinePreviewController: NSObject {
         guard let rect = finalRect, rect != currentRect else {
             layoutPreview(at: currentRect)
             if isPinned { fadeOutDimPanel() } else { restoreDimPanel(for: currentRect) }
-            showPreview()
+            showPreview(animated: false)
             return
         }
 
-        // 关键：**先抓屏、抓完再显示预览**。
-        // 要是先把窗口摆到新尺寸，这中间一两百毫秒里预览里装的还是旧图——
-        // 就是"松手那一下原图被拉伸一下"。
-        //
-        // 压暗层则相反，必须**在松手当帧立刻**铺回来、不等抓屏：
-        // 覆盖层撤掉的那一刻如果压暗层不在，整个屏幕是亮的，要等新图出来
-        // 才恢复——这就是"调节完成后闪一下"。压暗层的窗口号会被
-        // `recaptureSelection` 排除在抓屏之外，留在屏幕上不影响截出的图。
+        // 先裁、裁成功再动窗口：裁失败时如果先把窗口摆到新尺寸，图上还是旧图，
+        // 会被拉伸成新宽高，后面保存/复制都拿到一个对不上的选区。
+        guard let source, let cropped = source.crop(to: rect) else {
+            layoutPreview(at: currentRect)
+            if isPinned { fadeOutDimPanel() } else { restoreDimPanel(for: currentRect) }
+            showPreview(animated: false)
+            showFailure("重新框选失败，保留原来的范围")
+            return
+        }
+
+        // 压暗层要在松手当帧立刻铺回来：覆盖层撤掉的那一刻如果压暗层不在，
+        // 整个屏幕是亮的，等下一帧才暗回去——看起来就是"调节完成后闪一下"。
         // 钉住之后不重新铺压暗：那时用户已经在"看这张图"，压暗反而挡着他要对照的内容。
         if isPinned { hideDimPanel() } else { restoreDimPanel(for: rect) }
         layoutPreview(at: rect)          // 只挪窗口，预览仍是隐藏的
-        recaptureSelection(at: rect)     // 抓完在里面 showPreview()
+        applySelectionCrop(cropped)      // 换图并 showPreview()
     }
 
-    /// 显示预览与工具栏（带一点点淡入）。
-    private func showPreview() {
+    /// 显示预览与工具栏。
+    ///
+    /// `animated: false` 用在调整选区收尾：这时覆盖层还盖在上面，
+    /// 直接铺到最终状态，等覆盖层撤掉就是一帧接上，不会先亮一下实时桌面。
+    private func showPreview(animated: Bool = true) {
         // 钉住之后工具栏保持收起：那一刻起入口是图上右键和角落那颗「×」。
         let panels = isPinned ? [previewPanel] : [previewPanel, toolbarPanel]
         for panel in panels {
             guard let panel, panel.alphaValue < 1 else { continue }
-            panel.alphaValue = 0
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = Motion.duration(0.16)
-                panel.animator().alphaValue = 1
+            if animated {
+                panel.alphaValue = 0
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = Motion.duration(0.16)
+                    panel.animator().alphaValue = 1
+                }
+            } else {
+                panel.alphaValue = 1
             }
         }
         // 调整选区时 key 曾交给覆盖层窗口，这里拿回来，Esc / ⌘C 才继续有效
@@ -1044,9 +1123,13 @@ final class InlinePreviewController: NSObject {
     /// 抽成静态纯函数是为了让自检能直接量这条不变式，而不是复刻一遍算式 ——
     /// 之前拖动除以倍率的那个 bug，就是因为换算和摆放各写了一份、谁也没测。
     static func previewFrame(for rect: CGRect, zoom: CGFloat) -> NSRect {
-        let scaled = rect.insetBy(dx: -shadowPadding, dy: -shadowPadding)
-        let size = NSSize(width: scaled.width * zoom, height: scaled.height * zoom)
-        let center = CGPoint(x: scaled.midX, y: scaled.midY)
+        // 投影边距是**窗口边到图片边**的固定 18pt，不参与倍率：图片视图的
+        // 约束就是 `container ± shadowPadding`。以前把整块 padded 矩形一起乘
+        // zoom，于是图片实际大小是 `rect*zoom + 36*(zoom-1)` —— 放大后多出
+        // 几十 pt 且横纵比例跟着变，截图内容被非等比拉糊。
+        let size = NSSize(width: rect.width * zoom + shadowPadding * 2,
+                          height: rect.height * zoom + shadowPadding * 2)
+        let center = CGPoint(x: rect.midX, y: rect.midY)
         return NSRect(x: center.x - size.width / 2,
                       y: center.y - size.height / 2,
                       width: size.width,
@@ -1063,8 +1146,8 @@ final class InlinePreviewController: NSObject {
 
     /// 立刻撤掉压暗层，不做淡出。
     ///
-    /// 淡出那 0.18 秒里它还挂在屏幕上：调整选区时它会被拍进重新抓的图里，
-    /// 调整结束后它的挖空也还对不上新选区。索性直接收。
+    /// 淡出那 0.18 秒里它还挂在屏幕上：调整开始时覆盖层自带压暗，
+    /// 两层叠一起会让挖空处发黑；它的挖空也还对不上新选区。索性直接收。
     private func hideDimPanel() {
         let panels = dimPanels
         dimPanels = []
@@ -1077,7 +1160,7 @@ final class InlinePreviewController: NSObject {
 
     /// 调整完选区后把压暗层重新铺上，挖空对准**新的**选区。
     ///
-    /// 调整开始时为了抓屏把它收掉了（见 `beginAdjustingSelection`）。
+    /// 调整开始时把它收掉了（见 `beginAdjustingSelection`）。
     /// 这里刻意**不做淡入**：调用时机是覆盖层刚撤掉的同一帧，直接以满
     /// 透明度出现才能和覆盖层的压暗无缝衔接——淡入那 0.2 秒里背景会
     /// 先亮一下再暗回去，看起来就是"闪一下"。
@@ -1086,57 +1169,43 @@ final class InlinePreviewController: NSObject {
         buildDimPanel(for: rect)
     }
 
-    /// 按新的选区重新截一次，换上真像素。
+    /// 按新选区从**整屏原图**上重新裁一块，换上真像素。
     ///
-    /// 抓屏本身不可中断，但任务存在 `recaptureTask` 里，新一轮调整开始
-    /// （`beginAdjustingSelection`）或面板关闭（`dismiss`）时会取消它；
-    /// 抓回来后先查 `Task.isCancelled`，过期结果直接扔掉、不动界面。
-    private func recaptureSelection(at rect: CGRect) {
-        guard let screen = currentScreen else { return }
-        isRecapturing = true
-        recaptureTask?.cancel()
-        recaptureTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.isRecapturing = false }
-            do {
-                // 把 Grabi 自己的窗口从抓屏里排除掉，而**不是**先藏再等。
-                // 藏了就得等系统合成完再抓，那 200 多毫秒里用户眼前是空的——闪一下。
-                // 排除的方式预览面板可以一直停在屏幕上，抓完直接换图。
-                // （压暗层此刻已经按新选区铺回屏幕上了，同样靠排除保平安。）
-                var ourWindows: [CGWindowID] = self.adjustOverlay.dismissedWindowIDs
-                for panel in [self.previewPanel, self.toolbarPanel].compactMap({ $0 }) + self.dimPanels {
-                    ourWindows.append(CGWindowID(panel.windowNumber))
-                }
-
-                let fresh = try await CaptureEngine().captureRegion(rect, on: screen,
-                                                                    excludingWindowIDs: ourWindows)
-                // 抓屏期间面板可能已被关掉、或用户已经开始下一轮调整——
-                // 过期结果不上屏，否则会按旧选区把旧图铺回来
-                guard !Task.isCancelled, self.previewPanel != nil else { return }
-                self.image = fresh
-                self.previewView?.image = fresh
-                // 标注跟着旧那张一起作废：留着的话画在旧位置的红圈会盖到新内容上，
-                // 而它指的那个东西已经不在这儿了。清空比留着诚实。
-                self.previewView?.inkLayer.clearAll()
-                self.overwriteStoredFile(fresh)
-                // 压暗层在松手当帧就铺好了（见 `finishAdjustingSelection`），
-                // 这里只需要亮出预览——提前亮会看到旧图被拉伸的那一下
-                self.showPreview()
-                // 图变了，之前的识别结果作废，重新抢跑
-                if self.isOCRMode { self.leaveOCRMode() }
-                self.prefetchTask?.cancel()
-                self.prefetchTask = nil
-                self.startPrefetchingOCR()
-            } catch {
-                guard !Task.isCancelled, self.previewPanel != nil else { return }
-                Log.capture.error("按新选区重新截取失败: \(error.localizedDescription)")
-                self.showPreview()
-                self.showFailure("重新截取失败，先用当前这张")
-            }
-        }
+    /// 这里刻意不再抓屏：原图在截图那一刻就留下来了，改大小只是换一个裁剪矩形。
+    /// 所以整趟拖动没有异步等待——松手当帧就能换图，也不会出现"新范围里
+    /// 拍到了刚切过去的另一个窗口"这种前后两帧拼在一起的结果。
+    private func applySelectionCrop(_ cropped: CGImage) {
+        // 图换了：在途的旧 OCR 任务立刻作废。Vision 可能还会跑很久，等它回来
+        // 时 generation 已经变了，不会把旧图的文字装到新裁出来的这张上。
+        ocrGeneration += 1
+        ocrTask?.cancel()
+        ocrTask = nil
+        isRecognizing = false
+        failureResetTimer?.invalidate()
+        failureResetTimer = nil
+        failureText = nil
+        image = cropped
+        previewView?.image = cropped
+        // 先把新图真的画进 backing store 再让它露脸：`showPreview(animated: false)`
+        // 是直接置 alpha=1，若不先同步绘制，撤掉覆盖层的第一帧可能看到预览底色。
+        previewView?.layoutSubtreeIfNeeded()
+        previewView?.displayIfNeeded()
+        previewPanel?.displayIfNeeded()
+        // 标注跟着旧那张一起作废：留着的话画在旧位置的红圈会盖到新内容上，
+        // 而它指的那个东西已经不在这儿了。清空比留着诚实。
+        previewView?.inkLayer.clearAll()
+        overwriteStoredFile(cropped)
+        // 图变了，之前的识别结果 / 高亮 / OCR 工具栏都作废，重新抢跑。
+        // 先退 OCR 模式再 `showPreview`，否则新图会带着旧图的「复制选中」工具栏闪现一帧。
+        if isOCRMode { leaveOCRMode() }
+        rebuildToolbar()
+        showPreview(animated: false)
+        prefetchTask?.cancel()
+        prefetchTask = nil
+        startPrefetchingOCR()
     }
 
-    /// 改完选区、重截之后，把**磁盘上那一份**换成新的。
+    /// 改完选区、重新裁过之后，把**磁盘上那一份**换成新的。
     ///
     /// 只有"已经保存过"才覆盖 —— 没保存过就没有文件，那种时候去写一个不存在的
     /// 路径等于凭空造出一个半成品。
@@ -1203,6 +1272,7 @@ final class InlinePreviewController: NSObject {
                                  backing: .buffered,
                                  defer: false)
         panel.isFloatingPanel = true
+        panel.animationBehavior = .none
         panel.level = ShotLevels.toolbar
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -1589,15 +1659,25 @@ final class InlinePreviewController: NSObject {
         isRecognizing = true
         // 立刻切成转圈。冷启动那趟要几十秒，没有这个就是"点了没反应"。
         failureText = nil
+        failureResetTimer?.invalidate()
+        failureResetTimer = nil
         rebuildToolbar()
 
+        // 这张图这一趟的身份。Vision 不响应取消，await 回来时可能已经换了图，
+        // 只有 generation + previewView 双重一致才允许把结果写到界面上。
+        let generation = ocrGeneration
         Log.ocr.info("开始识别，isWarm=\(OCRRecognizer.isWarm)")
 
-        Task { @MainActor in
-            // 无论成功失败都要把转圈换回按钮，否则界面会永远停在那一个转圈上
+        ocrTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            // 无论成功失败都要把转圈换回按钮；但如果这张图已经被换掉 / 面板已经
+            // 关掉（generation 变了），新图那边有自己的状态，这里一个像素都别碰。
             defer {
-                self.isRecognizing = false
-                self.rebuildToolbar()
+                if self.ocrGeneration == generation {
+                    self.isRecognizing = false
+                    self.ocrTask = nil
+                    self.rebuildToolbar()
+                }
             }
             do {
                 let start = Date()
@@ -1610,8 +1690,11 @@ final class InlinePreviewController: NSObject {
                 // 这一趟可能跑几十秒，期间用户不必干等转圈（busy 那一档现在也放着
                 // 「保留 / 丢弃」）。面板已经没了还往下走的话：往一个不存在的预览层上
                 // 画高亮，再弹一句「已识别 N 行文字」—— 那句说的是他刚丢掉或刚留下的旧图。
-                guard previewPanel != nil else {
-                    Log.ui.info("识别跑完时预览已关闭，丢掉这批结果（\(Int(elapsed))ms）")
+                guard !Task.isCancelled,
+                      self.ocrGeneration == generation,
+                      self.previewPanel != nil,
+                      self.previewView === previewView else {
+                    Log.ui.info("识别跑完时预览已换图 / 关闭，丢掉这批结果（\(Int(elapsed))ms）")
                     return
                 }
 
@@ -1620,11 +1703,11 @@ final class InlinePreviewController: NSObject {
                     return
                 }
 
-                ocrLines = lines
-                releaseInkForOCR()
-                isOCRMode = true
+                self.ocrLines = lines
+                self.releaseInkForOCR()
+                self.isOCRMode = true
                 previewView.installOCRHighlights(lines: lines)
-                setPanelDragging(enabled: false)
+                self.setPanelDragging(enabled: false)
 
                 // 「识别结果同时存成同名 .txt」：图已经落盘就当场写；还没落盘
                 // （默认就是还没）只能**预告** —— 那个"同名"此刻还不存在。
@@ -1640,25 +1723,31 @@ final class InlinePreviewController: NSObject {
                     }
                 }
 
-                rebuildToolbar()
+                self.rebuildToolbar()
 
                 // 认出了多少行、现在能干什么 —— 划选这个能力看不见摸不着，
                 // 不提示等于没有。
                 ToastHUDController.shared.show(title: "已识别 \(lines.count) 行文字",
                                                detail: textNote ?? "在原图上按住拖动即可划选",
-                                               screen: currentScreen,
+                                               screen: self.currentScreen,
                                                duration: 4.4)
 
                 Log.ocr.info("识别到 \(lines.count) 行，耗时 \(Int(elapsed)) ms")
 
                 if SettingsStore.shared.autoCopyOCRText {
-                    copyAllText()
+                    self.copyAllText()
                 }
             } catch is Timeout {
+                guard !Task.isCancelled,
+                      self.ocrGeneration == generation,
+                      self.previewPanel != nil else { return }
                 // Vision 卡住时不能无限等：提示 + 按钮回到可点状态，让用户能立刻重试
                 Log.ocr.error("识别超时（\(Int(Self.ocrTimeout)) 秒）")
                 self.showFailure("识别超时，再点一次试试")
             } catch {
+                guard !Task.isCancelled,
+                      self.ocrGeneration == generation,
+                      self.previewPanel != nil else { return }
                 let nsError = error as NSError
                 Log.ocr.error("识别失败 [\(nsError.domain, privacy: .public) \(nsError.code)]: \(nsError.localizedDescription, privacy: .public)")
                 self.showFailure(self.shortFailureText(nsError))
@@ -2101,13 +2190,17 @@ final class InlinePreviewController: NSObject {
     func dismiss(reason: DismissReason) {
         // 点击外部关闭的监听随面板一起撤掉
         removeClickAwayMonitor()
-        // 上一张图的抢跑别再跑了：图已经换（或面板已经关），结果没人会用
+        // 上一张图的抢跑 / 识别别再往界面上写结果了：图已经换（或面板已经关）。
+        // 先换代再 cancel；Vision 不响应取消时，await 回来的旧任务会看到 generation 不符。
+        ocrGeneration += 1
+        ocrTask?.cancel()
+        ocrTask = nil
+        isRecognizing = false
+        failureResetTimer?.invalidate()
+        failureResetTimer = nil
+        failureText = nil
         prefetchTask?.cancel()
         prefetchTask = nil
-        // 在途的重新抓屏也一样：面板都没了，抓回来也没处放，
-        // 不取消的话它完成时还会按旧选区铺一块压暗层留在屏幕上
-        recaptureTask?.cancel()
-        recaptureTask = nil
         // 调整选区的覆盖层也一并拆掉，别让它留在屏幕上
         adjustOverlay.cancel()
 
@@ -2121,10 +2214,12 @@ final class InlinePreviewController: NSObject {
         dimPanels = []
         previewView = nil
         handlesView = nil
+        closeButton = nil
+        isHoveringPreview = false
         image = nil
+        source = nil
         url = nil
         isOCRMode = false
-        isRecapturing = false
         ocrLines = []
         // 复位"钉住"相关的状态：下一张截图必须还是"刚浮出来、点别处能收走"
         // 的那一档，不能继承上一张拖走后的钉住态。
@@ -2170,6 +2265,13 @@ final class DimOverlayView: NSView {
         didSet { needsDisplay = true }
     }
 
+    /// 选区里要显示的**整屏原图**。nil = 挖空露出实时屏幕（预览阶段的压暗层）。
+    /// 调整截图尺寸时传进来：只把原图铺在挖空里，外面的屏幕保持实时 + 压暗，
+    /// 用户既能看到原图像素，又不会被整屏冻结帧"震"一下。
+    var sourceImage: CGImage? {
+        didSet { needsDisplay = true }
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
 
@@ -2178,17 +2280,25 @@ final class DimOverlayView: NSView {
 
         guard let hole = holeRect, hole.width > 1, hole.height > 1 else { return }
 
-        // 挖空：用 .clear 混合模式擦掉刚铺的暗色，直接看到底下真实画面。
-        //
-        // 给"擦除"挂一层阴影，阴影的模糊会在选区边缘形成由深到浅的过渡，
-        // 遮罩就不会和背景硬碰硬。模糊别给太大——太大选区看着像发虚，
-        // 10pt 足够化掉那条 1px 硬边，又不影响"这里就是选区"的判断。
-        let feather: CGFloat = 10
-        context.saveGState()
-        context.setBlendMode(.clear)
-        context.setShadow(offset: .zero, blur: feather, color: NSColor.black.cgColor)
-        context.fill(hole.insetBy(dx: feather, dy: feather))
-        context.restoreGState()
+        if let sourceImage {
+            // 调整尺寸：挖空里铺原图（整屏图按本视图坐标铺满），外面保持实时画面。
+            context.saveGState()
+            context.clip(to: hole)
+            context.draw(sourceImage, in: bounds)
+            context.restoreGState()
+        } else {
+            // 预览阶段：用 .clear 擦掉暗色，直接看到底下真实画面。
+            //
+            // 给"擦除"挂一层阴影，阴影的模糊会在选区边缘形成由深到浅的过渡，
+            // 遮罩就不会和背景硬碰硬。模糊别给太大——太大选区看着像发虚，
+            // 10pt 足够化掉那条 1px 硬边，又不影响"这里就是选区"的判断。
+            let feather: CGFloat = 10
+            context.saveGState()
+            context.setBlendMode(.clear)
+            context.setShadow(offset: .zero, blur: feather, color: NSColor.black.cgColor)
+            context.fill(hole.insetBy(dx: feather, dy: feather))
+            context.restoreGState()
+        }
 
         // 边缘只留一圈极淡的高光，别再画硬线——软边已经够把选区勾出来了
         context.setStrokeColor(NSColor.white.withAlphaComponent(0.10).cgColor)
@@ -2596,6 +2706,16 @@ final class PreviewPanel: NSPanel {
     var onKeep: (() -> Void)?
     /// ⌘C：复制（OCR 文字或整图）。
     var onCopy: (() -> Void)?
+
+    /// 主菜单「视图」的放大 / 缩小 / 实际大小。三条 selector 的 target 留 nil，
+    /// 由这条转发链接到真正的 `InlinePreviewController`。
+    var onZoomIn: (() -> Void)?
+    var onZoomOut: (() -> Void)?
+    var onZoomReset: (() -> Void)?
+
+    @objc func zoomIn(_ sender: Any?) { onZoomIn?() }
+    @objc func zoomOut(_ sender: Any?) { onZoomOut?() }
+    @objc func resetZoom(_ sender: Any?) { onZoomReset?() }
 
     override func cancelOperation(_ sender: Any?) { onEscape?() }
 

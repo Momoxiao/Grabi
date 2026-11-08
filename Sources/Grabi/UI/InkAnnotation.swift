@@ -136,27 +136,34 @@ enum Ink {
             guard let last = pts.last, pts.count > 1 else { return nil }
             let rect = NSRect(x: min(first.x, last.x), y: min(first.y, last.y),
                               width: abs(last.x - first.x), height: abs(last.y - first.y))
-            guard rect.width > 0.5, rect.height > 0.5 else { return nil }
             switch shape {
-            case .rectangle:
-                path.appendRect(rect)
-            case .ellipse:
-                path.appendOval(in: rect)
-            case .line:
+            case .rectangle, .ellipse:
+                // 矩形 / 椭圆的面积靠两个方向都有跨度；零宽或零高的框没有可画的边界，
+                // 单击误触也不该留下一笔。
+                guard rect.width > 0.5, rect.height > 0.5 else { return nil }
+                if shape == .rectangle {
+                    path.appendRect(rect)
+                } else {
+                    path.appendOval(in: rect)
+                }
+            case .line, .arrow:
+                // 直线 / 箭头只需要**长度**，不需要宽高都非零：水平线和垂直线是
+                // 最常画的两种（下划线、指引），以前共用矩形那条「宽高都 > 0.5」的
+                // 门槛，导致它们被当成"没拖动"直接丢掉，用户怎么拖都画不出来。
+                guard hypot(last.x - first.x, last.y - first.y) > 0.5 else { return nil }
                 path.move(to: first)
                 path.line(to: last)
-            case .arrow:
-                path.move(to: first)
-                path.line(to: last)
-                // 箭头那两条须：`angle + π` 是从尖头往回指，±0.45 张开。
-                // 须长跟着**线宽**走而不是跟着线长走 —— 线拉得再长也该是那个粗细的须，
-                // 按比例缩的话一根长箭头会拖出两把扇子。
-                let angle = atan2(last.y - first.y, last.x - first.x)
-                let barb = max(8, path.lineWidth * 4)
-                for spread in [Double.pi - 0.45, Double.pi + 0.45] {
-                    path.move(to: last)
-                    path.line(to: NSPoint(x: last.x + cos(angle + spread) * barb,
-                                          y: last.y + sin(angle + spread) * barb))
+                if shape == .arrow {
+                    // 箭头那两条须：`angle + π` 是从尖头往回指，±0.45 张开。
+                    // 须长跟着**线宽**走而不是跟着线长走 —— 线拉得再长也该是那个粗细的须，
+                    // 按比例缩的话一根长箭头会拖出两把扇子。
+                    let angle = atan2(last.y - first.y, last.x - first.x)
+                    let barb = max(8, path.lineWidth * 4)
+                    for spread in [Double.pi - 0.45, Double.pi + 0.45] {
+                        path.move(to: last)
+                        path.line(to: NSPoint(x: last.x + cos(angle + spread) * barb,
+                                              y: last.y + sin(angle + spread) * barb))
+                    }
                 }
             }
             return path

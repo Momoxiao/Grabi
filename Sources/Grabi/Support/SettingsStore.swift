@@ -73,6 +73,24 @@ final class SettingsStore {
 
     private let defaults = UserDefaults.standard
 
+    /// 设置窗的滑杆范围就是这个区间；旧偏好或手工改过的 defaults 里若存了
+    /// 越界值，直接交给 ImageIO 会得到 0% 或非法的压缩质量。
+    static let jpegQualityRange: ClosedRange<Double> = 0.3...1.0
+    static let defaultJPEGQuality = 0.9
+    static let defaultSaveDirectory = NSString(string: "~/Pictures/Grabi").expandingTildeInPath
+
+    static func clampedJPEGQuality(_ value: Double) -> Double {
+        guard value.isFinite else { return defaultJPEGQuality }
+        return min(max(value, jpegQualityRange.lowerBound), jpegQualityRange.upperBound)
+    }
+
+    /// 旧版本 / 手工改过的 defaults 里可能存着单修饰键组合。那种组合注册到
+    /// Carbon 后会把 ⌘C、⌃A 这类全局键抢走，系统却不会报错；读出来时退回默认值。
+    static func sanitizedHotKey(_ spec: HotKeySpec, fallback: HotKeySpec) -> HotKeySpec {
+        if spec.isDisabled { return spec }
+        return spec.modifierCount >= 2 ? spec : fallback
+    }
+
     private enum Key {
         static let saveDirectory   = "saveDirectory"
         static let fileNamePattern = "fileNamePattern"
@@ -97,10 +115,10 @@ final class SettingsStore {
 
     private init() {
         defaults.register(defaults: [
-            Key.saveDirectory:   NSString(string: "~/Pictures/Grabi").expandingTildeInPath,
+            Key.saveDirectory:   Self.defaultSaveDirectory,
             Key.fileNamePattern: "Grabi-{date}-{time}",
             Key.imageFormat:     ImageFormat.png.rawValue,
-            Key.jpegQuality:     0.9,
+            Key.jpegQuality:     Self.defaultJPEGQuality,
             Key.saveOCRText:     false,
             Key.ocrLanguages:    ["zh-Hans", "en-US"],
             Key.playSound:       true,
@@ -118,7 +136,14 @@ final class SettingsStore {
     // MARK: - 保存
 
     var saveDirectory: String {
-        get { defaults.string(forKey: Key.saveDirectory) ?? "" }
+        get {
+            let raw = defaults.string(forKey: Key.saveDirectory) ?? ""
+            // 空串会让 URL(fileURLWithPath:) 落到当前工作目录（.app 启动时是 /）：
+            // 截图看似保存成功，用户却在图片文件夹里找不到。旧偏好里存过空串时
+            // 必须回退到注册默认值。
+            return raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? Self.defaultSaveDirectory : raw
+        }
         set { defaults.set(newValue, forKey: Key.saveDirectory) }
     }
 
@@ -129,7 +154,12 @@ final class SettingsStore {
     @discardableResult
     func ensureSaveDirectory() -> Bool {
         let url = saveDirectoryURL
-        if FileManager.default.fileExists(atPath: url.path) { return true }
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) {
+            // 同名文件会把 createDirectory 顶回来；这里若回报 true，诊断和启动
+            // 都会说"目录可用"，直到用户真的截图才看到写入失败。
+            return isDirectory.boolValue
+        }
         do {
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
             return true
@@ -150,8 +180,13 @@ final class SettingsStore {
     }
 
     var jpegQuality: Double {
-        get { defaults.double(forKey: Key.jpegQuality) }
-        set { defaults.set(newValue, forKey: Key.jpegQuality) }
+        get {
+            guard defaults.object(forKey: Key.jpegQuality) != nil else {
+                return Self.defaultJPEGQuality
+            }
+            return Self.clampedJPEGQuality(defaults.double(forKey: Key.jpegQuality))
+        }
+        set { defaults.set(Self.clampedJPEGQuality(newValue), forKey: Key.jpegQuality) }
     }
 
     var saveOCRText: Bool {
@@ -162,7 +197,12 @@ final class SettingsStore {
     // MARK: - OCR
 
     var ocrLanguages: [String] {
-        get { defaults.stringArray(forKey: Key.ocrLanguages) ?? ["zh-Hans", "en-US"] }
+        get {
+            let list = defaults.stringArray(forKey: Key.ocrLanguages) ?? []
+            // 空数组会让设置面板显示"一个语言都没选"，而 OCR 实际会退回英文；
+            // 旧偏好里存过空数组时按默认值处理，别让界面和实际行为分家。
+            return list.isEmpty ? ["zh-Hans", "en-US"] : list
+        }
         set { defaults.set(newValue, forKey: Key.ocrLanguages) }
     }
 
@@ -243,7 +283,9 @@ final class SettingsStore {
     // MARK: - 最近截图
 
     var recentShots: [String] {
-        get { defaults.stringArray(forKey: Key.recentShots) ?? [] }
+        // 老版本没有写入上限，读到超过 10 条的旧偏好也要按当前上限收回来，
+        // 否则菜单会显示一长串"最近截图"。
+        get { Array((defaults.stringArray(forKey: Key.recentShots) ?? []).prefix(10)) }
         set { defaults.set(Array(newValue.prefix(10)), forKey: Key.recentShots) }
     }
 
@@ -282,7 +324,7 @@ final class SettingsStore {
         guard let data = defaults.data(forKey: key),
               let spec = try? JSONDecoder().decode(HotKeySpec.self, from: data)
         else { return fallback }
-        return spec
+        return Self.sanitizedHotKey(spec, fallback: fallback)
     }
 
     private func writeHotKey(_ key: String, _ spec: HotKeySpec) {
@@ -368,29 +410,46 @@ final class SettingsStore {
         var issues = unknownPlaceholders(in: pattern).map {
             "未知占位符 \($0) 会原样写进文件名"
         }
-        let expanded = expand(pattern, type: type)
-        let illegal = CharacterSet(charactersIn: "/\\:*?\"<>|\n\r\t")
-        if expanded.rangeOfCharacter(from: illegal) != nil {
-            issues.append("非法字符已换成 -")
-        }
-        if expanded.hasPrefix(".") { issues.append("开头的点已去掉（否则成了隐藏文件）") }
-        if expanded.hasSuffix(".") { issues.append("末尾的点已去掉") }
-        // 按预算判，不比字节数：去掉一个点也会让长度变短，
-        // 那样"开头的点已去掉"会顺带把"超长已截断"也报出来 —— 说了没做的事。
-        if expanded.utf8.count > nameByteBudget { issues.append("超长已截断") }
+        let cleaned = cleanTemplate(expand(pattern, type: type))
+        if cleaned.hadIllegal { issues.append("非法字符已换成 -") }
+        if cleaned.hadLeadingDot { issues.append("开头的点已去掉（否则成了隐藏文件）") }
+        if cleaned.hadTrailingDot { issues.append("末尾的点已去掉") }
+        // 按**清洗后**的字节数判：行尾空白和末尾的点本来就会被剥掉，拿清洗前的
+        // 长度判会把没做的"截断"也说成做了；反过来，先 trim 再判也不会漏掉
+        // "空白 + 点"开头的隐藏文件。
+        if cleaned.text.utf8.count > nameByteBudget { issues.append("超长已截断") }
         return issues
     }
 
-    static func sanitize(_ name: String) -> String {
-        var name = name
+    /// 把模板展开结果清洗到"能直接当文件名"的那一步，并报告动过哪几刀。
+    /// `sanitize` 和 `templateIssues` 共用这一份，面板上的提示不会和落盘行为分家。
+    private static func cleanTemplate(_ expanded: String)
+        -> (text: String, hadIllegal: Bool, hadLeadingDot: Bool, hadTrailingDot: Bool) {
         let illegal = CharacterSet(charactersIn: "/\\:*?\"<>|\n\r\t")
-        name = name.components(separatedBy: illegal).joined(separator: "-")
-        // 以点开头会被当成隐藏文件：用户只看得到"截图不见了"，Finder 里却搜不着。
-        while name.hasPrefix(".") { name.removeFirst() }
-        name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hadIllegal = expanded.rangeOfCharacter(from: illegal) != nil
+        var text = expanded.components(separatedBy: illegal).joined(separator: "-")
+        var hadLeadingDot = false
+        var hadTrailingDot = false
+
+        // 先 trim 再剥点：模板写成「 .截图」时，如果先剥点再 trim，开头那个
+        // 空白会把点"藏"过去，最后仍存成隐藏文件。
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        while text.hasPrefix(".") {
+            hadLeadingDot = true
+            text.removeFirst()
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         // 末尾的点同样会惹麻烦（"名字." 加扩展名后变成 "名字..png"）。
-        while name.hasSuffix(".") { name.removeLast() }
-        name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        while text.hasSuffix(".") {
+            hadTrailingDot = true
+            text.removeLast()
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return (text, hadIllegal, hadLeadingDot, hadTrailingDot)
+    }
+
+    static func sanitize(_ name: String) -> String {
+        var name = cleanTemplate(name).text
 
         if name.utf8.count > nameByteBudget {
             // 按 Character 走，才不会把一个 emoji 或组合字母从中间截断成乱码。
@@ -400,6 +459,12 @@ final class SettingsStore {
                 cut.append(character)
             }
             name = cut.trimmingCharacters(in: .whitespacesAndNewlines)
+            // 截断点可能正好落在末尾的点上；剥点的规则必须在截断之后再跑一次，
+            // 否则会得到「名字.」+「.png」=「名字..png」。
+            while name.hasSuffix(".") {
+                name.removeLast()
+                name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
         }
         return name.isEmpty ? "Grabi" : name
     }

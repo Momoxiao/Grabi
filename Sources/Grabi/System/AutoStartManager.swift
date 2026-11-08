@@ -222,16 +222,65 @@ final class AutoStartManager {
         }
 
         guard !isAlreadyCorrect(launchAtLogin: launchAtLogin, keepAlive: keepAlive) else {
+            // 配置本身对了，但旧版本可能留下过"登录项 + 后台项"两份登记。
+            // 每次启动顺手把非生效的那条通道收掉，用户才不会被两个实例轮流拉起。
+            enforceSingleChannel()
             Log.system.debug("自启动配置已符合设置，跳过同步")
             return
         }
         apply(launchAtLogin: launchAtLogin, keepAlive: keepAlive, silent: true)
     }
 
+    /// 只留下 `activeMechanism` 选中的那一条通道；其余已挂上的登记全部注销。
+    private func enforceSingleChannel() {
+        switch activeMechanism {
+        case .keepAliveAgent:
+            _ = unregisterLoginItem(silent: true)
+        case .loginItem:
+            _ = unregisterAgent(plistName: keepAlivePlistName, silent: true)
+        case .manualPlist:
+            // 手写 plist 生效时，系统两条通道都不该同时挂着。
+            _ = unregisterLoginItem(silent: true)
+            _ = unregisterAgent(plistName: keepAlivePlistName, silent: true)
+        case .none:
+            break
+        }
+    }
+
     private func isAlreadyCorrect(launchAtLogin: Bool, keepAlive: Bool) -> Bool {
         if !launchAtLogin && !keepAlive { return activeMechanism == .none }
-        if keepAlive { return activeMechanism == .keepAliveAgent || activeMechanism == .manualPlist }
-        return activeMechanism == .loginItem || activeMechanism == .manualPlist
+
+        // 手动 plist 是否"正确"不能只看文件在不在：旧版本 / 上一轮兜底可能写的是
+        // KeepAlive=SuccessfulExit=false。用户已经关掉保活时，这份旧文件会让 app
+        // 继续在崩溃后被拉起，所以必须读内容比对。
+        if activeMechanism == .manualPlist {
+            guard let manualKeepAlive = manualPlistKeepAlive else { return false }
+            return manualKeepAlive == keepAlive
+        }
+        if keepAlive { return activeMechanism == .keepAliveAgent }
+        return activeMechanism == .loginItem
+    }
+
+    /// 读取手动 LaunchAgent 的保活语义；nil = 文件存在但解析不了（按不正确处理）。
+    private var manualPlistKeepAlive: Bool? {
+        guard let data = try? Data(contentsOf: plistURL),
+              let object = try? PropertyListSerialization.propertyList(from: data,
+                                                                        options: [],
+                                                                        format: nil),
+              let plist = object as? [String: Any] else { return nil }
+        switch plist["KeepAlive"] {
+        case let flag as Bool:
+            return flag
+        case let dictionary as [String: Any]:
+            // 我们写的形态是 SuccessfulExit=false（异常退出才重启）；缺这个键时
+            // launchd 按 KeepAlive=true 处理。
+            if let successfulExit = dictionary["SuccessfulExit"] as? Bool {
+                return !successfulExit
+            }
+            return true
+        default:
+            return false
+        }
     }
 
     /// - Parameter force: 忽略"已经注册过"的判断，强制先注销再注册（刷新签名登记）。
@@ -245,41 +294,77 @@ final class AutoStartManager {
         }
 
         guard launchAtLogin || keepAlive else {
-            teardownAll()
+            teardownAll(silent: silent)
             UserDefaults.standard.removeObject(forKey: fingerprintKey)
             return
         }
 
         if keepAlive {
-            unregisterLoginItem(silent: true)
-            uninstallManualPlist()
+            // 先确认旧通道真的注销了再注册新通道。注销失败还继续注册，会同时留下
+            // 登录项和后台项两份登记：下次登录被拉起两次（第二个实例靠单实例锁
+            // 退出，但两份自启都还在），用户关掉其中一个也关不干净。
+            guard unregisterLoginItem(silent: true) else {
+                reportTransitionFailure(
+                    "没能注销已有的登录项，已停止切换到后台保活，避免同时存在两个自启动通道。请先在「系统设置 › 通用 › 登录项与扩展」里关闭 Grabi，再回来试一次。",
+                    silent: silent)
+                return
+            }
+            guard uninstallManualPlist(silent: silent) else { return }
 
             if registerAgent(plistName: keepAlivePlistName, silent: silent, force: force) {
                 recordFingerprint()
                 return
             }
-            installManualPlist(executable: executable, runAtLoad: true, silent: silent)
-            recordFingerprint()
+            if installManualPlist(executable: executable, runAtLoad: true,
+                                  keepAlive: true, silent: silent) {
+                recordFingerprint()
+            }
             return
         }
 
         // 只要开机自启，不要保活
-        unregisterAgent(plistName: keepAlivePlistName, silent: true)
+        guard unregisterAgent(plistName: keepAlivePlistName, silent: true) else {
+            reportTransitionFailure(
+                "没能注销已有的后台项，已停止切换到登录项，避免同时存在两个自启动通道。请先在「系统设置 › 通用 › 登录项与扩展」里关闭 Grabi，再回来试一次。",
+                silent: silent)
+            return
+        }
 
         if registerLoginItem(silent: silent, force: force) {
-            uninstallManualPlist()
+            guard uninstallManualPlist(silent: silent) else { return }
             recordFingerprint()
             return
         }
 
-        installManualPlist(executable: executable, runAtLoad: true, silent: silent)
-        recordFingerprint()
+        // 兜底 LaunchAgent 也必须遵守「只要登录自启、不要崩溃保活」：
+        // 不能沿用保活版的 KeepAlive，否则用户关掉保活也还是会被 crash 重启。
+        if installManualPlist(executable: executable, runAtLoad: true,
+                              keepAlive: false, silent: silent) {
+            recordFingerprint()
+        }
     }
 
-    private func teardownAll() {
-        unregisterLoginItem(silent: true)
-        unregisterAgent(plistName: keepAlivePlistName, silent: true)
-        uninstallManualPlist()
+    private func reportTransitionFailure(_ text: String, silent: Bool) {
+        Log.system.error("\(text, privacy: .public)")
+        if !silent { presentInfo(text) }
+    }
+
+    @discardableResult
+    private func teardownAll(silent: Bool) -> Bool {
+        let loginOK = unregisterLoginItem(silent: true)
+        let agentOK = unregisterAgent(plistName: keepAlivePlistName, silent: true)
+        let plistOK = uninstallManualPlist(silent: true)
+        var failed: [String] = []
+        if !loginOK { failed.append("登录项") }
+        if !agentOK { failed.append("后台项") }
+        if !plistOK { failed.append("LaunchAgent 配置") }
+        guard failed.isEmpty else {
+            reportTransitionFailure(
+                "没能关闭\(failed.joined(separator: "、"))，系统里可能还留着自启动登记。请到「系统设置 › 通用 › 登录项与扩展」检查。",
+                silent: silent)
+            return false
+        }
+        return true
     }
 
     // MARK: - 通道一：系统托管
@@ -434,8 +519,11 @@ final class AutoStartManager {
 
     // MARK: - 通道二：手写 LaunchAgent（兜底）
 
-    private func installManualPlist(executable: URL, runAtLoad: Bool, silent: Bool) {
-        let plist = makeManualPlist(executable: executable, runAtLoad: runAtLoad)
+    @discardableResult
+    private func installManualPlist(executable: URL, runAtLoad: Bool,
+                                    keepAlive: Bool, silent: Bool) -> Bool {
+        let plist = makeManualPlist(executable: executable, runAtLoad: runAtLoad,
+                                    keepAlive: keepAlive)
         do {
             try FileManager.default.createDirectory(
                 at: plistURL.deletingLastPathComponent(),
@@ -448,29 +536,49 @@ final class AutoStartManager {
         } catch {
             Log.system.error("写入 LaunchAgent 失败: \(error.localizedDescription)")
             if !silent { presentInfo("写入自启动配置失败：\(error.localizedDescription)") }
-            return
+            return false
         }
         reloadManualAgent(silent: silent)
+        return true
     }
 
-    private func makeManualPlist(executable: URL, runAtLoad: Bool) -> [String: Any] {
-        [
+    private func makeManualPlist(executable: URL, runAtLoad: Bool,
+                                 keepAlive: Bool) -> [String: Any] {
+        var plist: [String: Any] = [
             "Label": label,
             "ProgramArguments": [executable.path],
             "RunAtLoad": runAtLoad,
-            "KeepAlive": ["SuccessfulExit": false],
             "ThrottleInterval": throttleSeconds,
             "ProcessType": "Interactive",
             "LimitLoadToSessionType": "Aqua",
             "WorkingDirectory": executable.deletingLastPathComponent().path
         ]
+        // 只有保活才写 KeepAlive。登录自启走同一条兜底通道时，写成
+        // KeepAlive=true 会把"崩溃后重启"也一并打开，用户关掉的开关又回来了。
+        plist["KeepAlive"] = keepAlive ? (["SuccessfulExit": false] as [String: Any]) : false
+        return plist
     }
 
-    func uninstallManualPlist() {
-        guard isManualPlistInstalled else { return }
+    /// 自检用的纯数据入口：不读真 bundle、不碰 launchd。
+    func manualPlistForSelfTest(keepAlive: Bool) -> [String: Any] {
+        makeManualPlist(executable: URL(fileURLWithPath: "/Applications/Grabi.app"),
+                        runAtLoad: true, keepAlive: keepAlive)
+    }
+
+    @discardableResult
+    func uninstallManualPlist(silent: Bool = false) -> Bool {
+        guard isManualPlistInstalled else { return true }
         bootoutManualAgent()
-        try? FileManager.default.removeItem(at: plistURL)
-        Log.system.info("已移除 LaunchAgent")
+        do {
+            try FileManager.default.removeItem(at: plistURL)
+            Log.system.info("已移除 LaunchAgent")
+            return true
+        } catch {
+            reportTransitionFailure(
+                "没能移除 LaunchAgent 配置（\(plistURL.path)）：下次登录系统仍可能按旧配置启动 Grabi。请手动删除该文件后重试。",
+                silent: silent)
+            return false
+        }
     }
 
     private func reloadManualAgent(silent: Bool) {
@@ -512,7 +620,8 @@ final class AutoStartManager {
         guard let executable = Bundle.main.executableURL else {
             return "（不是以 bundle 形式运行，无法确定可执行文件路径）"
         }
-        let plist = makeManualPlist(executable: executable, runAtLoad: true)
+        let plist = makeManualPlist(executable: executable, runAtLoad: true,
+                                    keepAlive: SettingsStore.shared.keepAlive)
         guard let data = try? PropertyListSerialization.data(fromPropertyList: plist,
                                                              format: .xml,
                                                              options: 0),
