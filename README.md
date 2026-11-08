@@ -191,7 +191,7 @@ xattr -dr com.apple.quarantine "/Applications/Grabi.app"
 需要 macOS 14+ 与 Xcode Command Line Tools。
 
 ```bash
-git clone <repo-url> Grabi
+git clone https://github.com/Momoxiao/Grabi.git Grabi
 cd Grabi
 ./build.sh release install
 ```

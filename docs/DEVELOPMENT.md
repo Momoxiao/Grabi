@@ -182,7 +182,7 @@ OCR 模式下工具栏换成文字那一排：**复制文字**（只复制划选
 需要 macOS 14+ 与 Xcode 命令行工具。
 
 ```bash
-git clone <repo-url> && cd Grabi
+git clone https://github.com/Momoxiao/Grabi.git && cd Grabi
 ./build.sh release install
 ```
 
